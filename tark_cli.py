@@ -42,6 +42,12 @@ Usage (binary installed as `tark_cli` at ~/bin/tark_cli; examples below use that
     tark_cli contract-templates             # Contract templates (system)
     tark_cli clients [--search=X]           # Tenant clients
     tark_cli ingest <project> <board> --tasks '[{"subject":"..."}]'   # Batch ingest PM tasks
+    tark_cli wiki <task-id>                              # Fetch task wiki
+    tark_cli wiki <task-id> set     --section <h> --body <md>  # Upsert (preferred)
+    tark_cli wiki <task-id> append  --section <h> --body <md>  # Append (refuses if dup)
+    tark_cli wiki <task-id> replace --section <h> --body <md>  # Replace (404 if missing)
+    tark_cli stage <task-id> <stage>        # Advance task stage (gates on wiki)
+    tark_cli update <task-id> [--priority X] [--column Y] [--assignee Z] [--name ...]  # Patch task fields
     tark_cli tokens                         # List PATs
 
     tark_cli api <path> [--filter k=v ...]  # Generic GET for any /pat/<path>/
@@ -59,6 +65,7 @@ Auth: C2_PAT env var, or ~/.config/tark/config.json
 import argparse
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -148,9 +155,31 @@ def _request(method: str, path: str, body: dict | None = None, params: dict | No
                 scope_hint = ' Add pm:write scope to your PAT.'
             _err(f'Permission denied (403).{scope_hint}')
         elif e.code == 404:
+            try:
+                payload = json.loads(body_text)
+            except (json.JSONDecodeError, ValueError):
+                payload = None
+            if isinstance(payload, dict) and payload.get('detail'):
+                hint = ''
+                if 'wiki' in path and payload.get('header'):
+                    hint = '  Hint: use `wiki set` to upsert, or `wiki append` to add a new section.'
+                _err(f'Not found (404): {payload["detail"]}{hint}')
             _err(f'Not found (404): {path}')
         else:
-            _err(f'HTTP {e.code}: {body_text[:200]}')
+            # Surface structured DRF errors when present (e.g. stage-gate `missing_section`).
+            try:
+                payload = json.loads(body_text)
+            except (json.JSONDecodeError, ValueError):
+                payload = None
+            if isinstance(payload, dict) and (payload.get('detail') or payload.get('missing_section')):
+                detail = payload.get('detail') or ''
+                missing = payload.get('missing_section')
+                msg = f'HTTP {e.code}: {detail}'.strip().rstrip(':')
+                if missing:
+                    msg += f'  [missing_section="{missing}"]'
+                _err(msg)
+            else:
+                _err(f'HTTP {e.code}: {body_text[:500]}')
     except urllib.error.URLError as e:
         _err(f'Connection failed: {e.reason}')
 
@@ -787,6 +816,116 @@ def cmd_ingest(args):
 
 
 # ---------------------------------------------------------------------------
+# Commands: PM wiki + stage
+# ---------------------------------------------------------------------------
+
+_WIKI_HEADER_RE = re.compile(r'^##\s+(?P<title>.+?)\s*$', re.MULTILINE)
+
+
+def _wiki_section_exists(wiki_text: str, header: str) -> bool:
+    """Mirror of backend `_wiki_has_section`: anchored prefix match on `## {header}`."""
+    pattern = re.compile(rf'^{re.escape(header)}(:| Phase |$)')
+    for m in _WIKI_HEADER_RE.finditer(wiki_text or ''):
+        if pattern.match(m.group('title').strip()):
+            return True
+    return False
+
+
+def cmd_wiki(args):
+    """Fetch / set / append / replace task wiki sections.
+
+    Actions:
+        get      — fetch the markdown body (default)
+        set      — upsert: replace if section exists, else append (preferred for /brief)
+        append   — add a new `## Section` block; refuses if header already exists (use --force to override)
+        replace  — overwrite an existing section's body; 404 if header missing
+
+    NOTE: POST payload uses field name `body` (not `content`).
+    """
+    path = f'/api/v1/pat/pm/tasks/{args.task_id}/wiki/'
+
+    if args.action in (None, 'get'):
+        data = _get(path)
+        if args.json:
+            _json_out(data)
+            return
+        print(data.get('wiki', '') if isinstance(data, dict) else data)
+        return
+
+    if args.action not in ('set', 'append', 'replace'):
+        _err(f'Unknown wiki action "{args.action}". Use: get, set, append, replace')
+        return
+
+    if not args.section or args.body is None:
+        _err('--section and --body are required for set/append/replace')
+        return
+
+    op = args.action
+
+    # Pre-flight: GET current wiki for set/append safety checks.
+    # (replace doesn't need this — server returns 404 with detail if missing.)
+    if op in ('set', 'append'):
+        cur = _get(path)
+        wiki_text = cur.get('wiki', '') if isinstance(cur, dict) else ''
+        exists = _wiki_section_exists(wiki_text, args.section)
+        if op == 'set':
+            op = 'replace' if exists else 'append'
+        elif op == 'append' and exists and not getattr(args, 'force', False):
+            _err(
+                f'Section "## {args.section}" already exists on task #{args.task_id}. '
+                f'Use `wiki set` to upsert, `wiki replace` to overwrite, or pass --force to add a duplicate.'
+            )
+
+    payload = {'action': op, 'section': args.section, 'body': args.body}
+    data = _post(path, payload)
+    if args.json:
+        _json_out(data)
+        return
+    suffix = f' (via {op})' if args.action == 'set' else ''
+    print(f'  wiki {args.action} OK on task #{args.task_id} section "{args.section}"{suffix}')
+
+
+_UPDATE_FIELDS = ('priority', 'column', 'assignee', 'name', 'description',
+                  'estimate_hours', 'start_date', 'due_date', 'parent', 'board')
+
+
+def cmd_update(args):
+    """PATCH task fields on /api/v1/pat/pm/tasks/{id}/.
+
+    Curated set of common fields; for anything else use the `api` escape hatch:
+        tark_cli api pm/tasks/<id> --patch '{"field":"value"}'
+    """
+    body = {}
+    for fld in _UPDATE_FIELDS:
+        val = getattr(args, fld, None)
+        if val is not None:
+            body[fld] = val
+
+    if not body:
+        _err(f'No fields to update. Pass one of: --{", --".join(f.replace("_", "-") for f in _UPDATE_FIELDS)}')
+
+    data = _request('PATCH', f'/api/v1/pat/pm/tasks/{args.task_id}/', body=body)
+    if args.json:
+        _json_out(data)
+        return
+    changes = ', '.join(f'{k}={v}' for k, v in body.items())
+    print(f'  Updated #{args.task_id}: {changes}')
+
+
+def cmd_stage(args):
+    """Advance task to next stage. Server gates on wiki section presence."""
+    data = _post(f'/api/v1/pat/pm/tasks/{args.task_id}/stage/', {'stage': args.stage})
+    if args.json:
+        _json_out(data)
+        return
+    if isinstance(data, dict) and data.get('stage'):
+        prev = data.get('previous_stage', '?')
+        print(f'  Task #{args.task_id}: {prev} → {data["stage"]}')
+    else:
+        _json_out(data)
+
+
+# ---------------------------------------------------------------------------
 # Commands: System — contract types, blocks, templates
 # ---------------------------------------------------------------------------
 
@@ -1045,6 +1184,33 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--tasks', help='Tasks as JSON array string')
     p.add_argument('--tasks-file', help='Path to JSON file containing the tasks array')
 
+    # wiki <task-id> [get|set|append|replace] [--section H] [--body MD] [--force]
+    p = sub.add_parser('wiki', help='Task wiki get/set/append/replace (POST uses `body` field, not `content`)')
+    p.add_argument('task_id', type=int, help='Task ID')
+    p.add_argument('action', nargs='?', choices=['get', 'set', 'append', 'replace'], help='Default: get. `set` upserts.')
+    p.add_argument('--section', help='Section header (without leading "## ")')
+    p.add_argument('--body', help='Section markdown body')
+    p.add_argument('--force', action='store_true', help='Allow `append` to create a duplicate of an existing section')
+
+    # stage <task-id> <stage>
+    p = sub.add_parser('stage', help='Advance task stage (gates on wiki section)')
+    p.add_argument('task_id', type=int, help='Task ID')
+    p.add_argument('stage', help='Target stage: brief|plan|review_plan|work|verify|review_impl|document|commit|deploy')
+
+    # update <task-id> [field flags]
+    p = sub.add_parser('update', help='PATCH task fields (priority, column, assignee, name, ...)')
+    p.add_argument('task_id', type=int, help='Task ID')
+    p.add_argument('--priority', choices=['low', 'medium', 'high', 'urgent'], help='Task priority')
+    p.add_argument('--column', type=int, help='Board column ID')
+    p.add_argument('--assignee', type=int, help='Assignee user ID (use 0 to unassign — server may reject; prefer api --patch \'{"assignee":null}\')')
+    p.add_argument('--name', help='Task name/subject')
+    p.add_argument('--description', help='Task description')
+    p.add_argument('--estimate-hours', dest='estimate_hours', type=float, help='Estimated hours')
+    p.add_argument('--start-date', dest='start_date', help='Start date (YYYY-MM-DD)')
+    p.add_argument('--due-date', dest='due_date', help='Due date (YYYY-MM-DD)')
+    p.add_argument('--parent', type=int, help='Parent task ID')
+    p.add_argument('--board', type=int, help='Board ID (move task to a different board)')
+
     # contract-types, contract-templates
     sub.add_parser('contract-types', help='Contract types (system)')
     sub.add_parser('contract-templates', help='Contract templates (system)')
@@ -1099,6 +1265,9 @@ COMMANDS = {
     'contract-templates': cmd_contract_templates,
     'clients': cmd_clients,
     'ingest': cmd_ingest,
+    'wiki': cmd_wiki,
+    'stage': cmd_stage,
+    'update': cmd_update,
     'api': cmd_api,
     'tokens': cmd_tokens,
     'config': cmd_config,
