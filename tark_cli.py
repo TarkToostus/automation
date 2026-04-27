@@ -412,16 +412,45 @@ def cmd_task(args):
     print()
 
 
+def _resolve_board(project_id: int, board_arg: str | None) -> int:
+    """Resolve --board (ID or name) to a board ID. If omitted, pick the project's first board."""
+    boards = _get('/api/v1/pat/pm/boards/', project=project_id)
+    results = boards.get('results', boards) if isinstance(boards, dict) else boards
+    if not results:
+        _err(f'Project {project_id} has no boards. Create one in C2 first.')
+
+    if board_arg is None:
+        if len(results) > 1:
+            names = ', '.join(f'{b["name"]} (#{b["id"]})' for b in results[:5])
+            print(f'  Note: project has {len(results)} boards, using first. Pass --board to pick: {names}', file=sys.stderr)
+        return results[0]['id']
+
+    try:
+        bid = int(board_arg)
+        if any(b.get('id') == bid for b in results):
+            return bid
+        _err(f'Board #{bid} not in project {project_id}')
+    except ValueError:
+        match = [b for b in results if board_arg.lower() in (b.get('name') or '').lower()]
+        if not match:
+            _err(f'No board matching "{board_arg}" in project {project_id}')
+        if len(match) > 1:
+            names = ', '.join(f'{b["name"]} (#{b["id"]})' for b in match[:5])
+            _err(f'Ambiguous board "{board_arg}": {names}')
+        return match[0]['id']
+
+
 def cmd_create(args):
-    """Create a task."""
-    # Resolve project name to ID
+    """Create a task. POST /api/v1/pat/pm/tasks/ requires `name` + `board`."""
     try:
         project_id = int(args.project)
     except ValueError:
         project_id = _resolve_project(args.project)
 
-    subject = ' '.join(args.subject)
-    body = {'project': project_id, 'subject': subject, 'priority': args.priority or 'medium'}
+    board_id = _resolve_board(project_id, getattr(args, 'board', None))
+
+    name = ' '.join(args.subject)
+    body = {'name': name, 'board': board_id, 'priority': args.priority or 'medium'}
 
     user_id = _get_user_id()
     if user_id:
@@ -433,7 +462,7 @@ def cmd_create(args):
         _json_out(data)
         return
 
-    print(f'  Created #{data.get("id")}: {data.get("name")}')
+    print(f'  Created #{data.get("id")}: {data.get("name")}  (board #{board_id})')
 
 
 # ---------------------------------------------------------------------------
@@ -1104,7 +1133,8 @@ def build_parser() -> argparse.ArgumentParser:
     # create <project> <subject>
     p = sub.add_parser('create', help='Create task')
     p.add_argument('project', help='Project name or ID')
-    p.add_argument('subject', nargs='+', help='Task subject')
+    p.add_argument('subject', nargs='+', help='Task name (sent as `name` to API)')
+    p.add_argument('--board', '-b', help='Board name or ID (auto-picks project\'s first board if omitted)')
     p.add_argument('--priority', choices=['low', 'medium', 'high', 'urgent'], default='medium')
 
     # timer
