@@ -794,6 +794,53 @@ def cmd_clients(args):
     )
 
 
+_CLIENT_WRITABLE_FIELDS = (
+    'name', 'address', 'contact_info', 'registry_code',
+    'representative_name', 'representative_basis',
+    'email', 'billing_info', 'notes',
+)
+
+
+def _build_client_body(args, *, include_name: bool) -> dict:
+    body: dict = {}
+    if include_name:
+        body['name'] = args.name
+    for flag in _CLIENT_WRITABLE_FIELDS:
+        if flag == 'name' and not include_name:
+            continue
+        val = getattr(args, flag, None)
+        if val is not None:
+            body[flag] = val
+    contact = getattr(args, 'contact', None)
+    if contact is not None:
+        body['contact'] = contact
+    return body
+
+
+def cmd_clients_create(args):
+    """Create a tenant client (Company). POST /api/v1/pat/system/clients/ — needs sales:write."""
+    body = _build_client_body(args, include_name=True)
+    resp = _request('POST', '/api/v1/pat/system/clients/', body=body)
+    if args.json:
+        print(json.dumps(resp, indent=2))
+        return
+    print(f"  Created client #{resp.get('id')}: {resp.get('name', '')}")
+
+
+def cmd_clients_update(args):
+    """Update a tenant client. PATCH /api/v1/pat/system/clients/<id>/ — needs sales:write."""
+    body = _build_client_body(args, include_name=False)
+    if getattr(args, 'name', None) is not None:
+        body['name'] = args.name
+    if not body:
+        _err('clients-update requires at least one field flag (e.g. --notes)')
+    resp = _request('PATCH', f'/api/v1/pat/system/clients/{args.id}/', body=body)
+    if args.json:
+        print(json.dumps(resp, indent=2))
+        return
+    print(f"  Updated client #{resp.get('id')}: {resp.get('name', '')}")
+
+
 # ---------------------------------------------------------------------------
 # Commands: PM batch ingest
 # ---------------------------------------------------------------------------
@@ -1207,6 +1254,33 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--search', '-s', help='Search by name or address')
     p.add_argument('--limit', type=int, help='Max results')
 
+    # clients-create — needs sales:write
+    p = sub.add_parser('clients-create', help='Create a tenant client (Company) — needs sales:write')
+    p.add_argument('name', help='Company name (required)')
+    p.add_argument('--registry-code', dest='registry_code', help='Registry code (e.g. 11483740)')
+    p.add_argument('--email', help='Primary contact email')
+    p.add_argument('--address', help='Address')
+    p.add_argument('--contact-info', dest='contact_info', help='Free-form contact info')
+    p.add_argument('--contact', type=int, help='Contact (User) ID — must belong to your tenant')
+    p.add_argument('--representative-name', dest='representative_name', help='Legal representative name')
+    p.add_argument('--representative-basis', dest='representative_basis', help='Representative legal basis')
+    p.add_argument('--billing-info', dest='billing_info', help='Billing details')
+    p.add_argument('--notes', help='Notes')
+
+    # clients-update — needs sales:write
+    p = sub.add_parser('clients-update', help='Update a tenant client (PATCH) — needs sales:write')
+    p.add_argument('id', type=int, help='Client ID')
+    p.add_argument('--name', help='Company name')
+    p.add_argument('--registry-code', dest='registry_code', help='Registry code')
+    p.add_argument('--email', help='Primary contact email')
+    p.add_argument('--address', help='Address')
+    p.add_argument('--contact-info', dest='contact_info', help='Free-form contact info')
+    p.add_argument('--contact', type=int, help='Contact (User) ID — must belong to your tenant')
+    p.add_argument('--representative-name', dest='representative_name', help='Legal representative name')
+    p.add_argument('--representative-basis', dest='representative_basis', help='Representative legal basis')
+    p.add_argument('--billing-info', dest='billing_info', help='Billing details')
+    p.add_argument('--notes', help='Notes')
+
     # ingest (PM batch)
     p = sub.add_parser('ingest', help='Batch-create PM tasks (dedupes by subject)')
     p.add_argument('project', help='Project name or ID')
@@ -1294,6 +1368,8 @@ COMMANDS = {
     'contract-types': cmd_contract_types,
     'contract-templates': cmd_contract_templates,
     'clients': cmd_clients,
+    'clients-create': cmd_clients_create,
+    'clients-update': cmd_clients_update,
     'ingest': cmd_ingest,
     'wiki': cmd_wiki,
     'stage': cmd_stage,
