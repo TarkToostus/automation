@@ -689,6 +689,33 @@ def cmd_projects(args):
     )
 
 
+_PROJECT_UPDATE_FIELDS = ('name', 'description', 'status', 'owner',
+                          'start_date', 'end_date', 'client')
+
+
+def cmd_projects_update(args):
+    """PATCH PM project fields on /api/v1/pat/pm/projects/{id}/.
+
+    NOTE: backend `pat_urls.py` must register `partial_update: pm:write` for
+    `pm-project`; otherwise the server returns 405 Method Not Allowed.
+    """
+    body = {}
+    for fld in _PROJECT_UPDATE_FIELDS:
+        val = getattr(args, fld, None)
+        if val is not None:
+            body[fld] = val
+
+    if not body:
+        _err(f'No fields to update. Pass one of: --{", --".join(f.replace("_", "-") for f in _PROJECT_UPDATE_FIELDS)}')
+
+    data = _request('PATCH', f'/api/v1/pat/pm/projects/{args.id}/', body=body)
+    if args.json:
+        _json_out(data)
+        return
+    changes = ', '.join(f'{k}={v}' for k, v in body.items())
+    print(f'  Updated project #{args.id}: {changes}')
+
+
 def cmd_boards(args):
     """List PM boards. Optional --project filter."""
     _simple_list(
@@ -1237,6 +1264,17 @@ def build_parser() -> argparse.ArgumentParser:
     # projects
     sub.add_parser('projects', help='PM projects')
 
+    # projects-update — needs pm:write + backend `partial_update` registration in pat_urls.py
+    p = sub.add_parser('projects-update', help='PATCH a PM project (needs pm:write + backend partial_update)')
+    p.add_argument('id', type=int, help='Project ID')
+    p.add_argument('--name', help='Project name')
+    p.add_argument('--description', help='Description')
+    p.add_argument('--status', help='Status')
+    p.add_argument('--owner', type=int, help='Owner user ID (use api --patch \'{"owner":null}\' to unassign)')
+    p.add_argument('--start-date', dest='start_date', help='Start date (YYYY-MM-DD)')
+    p.add_argument('--end-date', dest='end_date', help='End date (YYYY-MM-DD)')
+    p.add_argument('--client', type=int, help='Client ID')
+
     # boards
     p = sub.add_parser('boards', help='PM boards')
     p.add_argument('--project', help='Filter by project ID')
@@ -1362,6 +1400,7 @@ COMMANDS = {
     'pipelines': cmd_pipelines,
     'pipeline-stages': cmd_pipeline_stages,
     'projects': cmd_projects,
+    'projects-update': cmd_projects_update,
     'boards': cmd_boards,
     'columns': cmd_columns,
     'comments': cmd_comments,
