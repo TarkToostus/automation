@@ -45,7 +45,15 @@ tark_cli tasks
 | `tark_cli time week` | Weekly time report grouped by project |
 | `tark_cli projects` / `boards` / `columns` | Browse PM structure |
 | `tark_cli leads` / `offers` / `contracts` | Browse CRM |
+| `tark_cli wiki 123` | Fetch task wiki markdown |
+| `tark_cli wiki 123 set --section Brief --body "..."` | Upsert a wiki section (preferred — dup-safe) |
+| `tark_cli wiki 123 append --section Brief --body "..."` | Append; refuses if section already exists |
+| `tark_cli wiki 123 replace --section Brief --body "..."` | Replace existing section's body |
+| `tark_cli stage 123 work` | Advance task stage (server gates on wiki sections) |
+| `tark_cli update 123 --priority high --assignee 38` | PATCH common task fields |
+| `tark_cli ingest <project> <board> --tasks-file tasks.json` | Bulk-create tasks (dedupes by subject) |
 | `tark_cli api <path>` | Generic GET against any `/api/v1/pat/<path>/` endpoint |
+| `tark_cli api <path> --post '{...}'` / `--patch '{...}'` | Generic POST / PATCH escape hatch |
 
 Run `tark_cli --help` for the full list, or `tark_cli <command> --help` for flags.
 
