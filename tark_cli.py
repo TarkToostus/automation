@@ -749,6 +749,33 @@ def cmd_comments(args):
     )
 
 
+def cmd_projects_create(args):
+    """Create a PM project via POST /api/v1/pat/pm/projects/."""
+    body: dict = {'name': args.name}
+    if args.description:
+        body['description'] = args.description
+    data = _request('POST', '/api/v1/pat/pm/projects/', body=body)
+    if args.json:
+        _json_out(data)
+        return
+    print(f"  Created project #{data.get('id')}: {data.get('name', '')}")
+
+
+def cmd_columns_create(args):
+    """Create a board column via POST /api/v1/pat/pm/board-columns/."""
+    body: dict = {
+        'board': args.board,
+        'name': args.name,
+        'order': args.order,
+        'is_done': args.done,
+    }
+    data = _request('POST', '/api/v1/pat/pm/board-columns/', body=body)
+    if args.json:
+        _json_out(data)
+        return
+    print(f"  Created column #{data.get('id')}: {data.get('name', '')} (board={args.board}, order={args.order}, done={args.done})")
+
+
 # ---------------------------------------------------------------------------
 # Commands: Sales — offer-lines, contracts, pipelines
 # ---------------------------------------------------------------------------
@@ -1287,6 +1314,18 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser('comments', help='Task comments')
     p.add_argument('--task', help='Filter by task ID')
 
+    # projects-create
+    p = sub.add_parser('projects-create', help='Create a PM project')
+    p.add_argument('name', help='Project name')
+    p.add_argument('--description', default='', help='Optional description')
+
+    # columns-create
+    p = sub.add_parser('columns-create', help='Create a board column')
+    p.add_argument('--board', type=int, required=True, help='Board ID')
+    p.add_argument('--name', required=True, help='Column name')
+    p.add_argument('--order', type=int, required=True, help='Display order (ascending)')
+    p.add_argument('--done', action='store_true', default=False, help='Mark column as done-state')
+
     # clients (core)
     p = sub.add_parser('clients', help='Tenant clients')
     p.add_argument('--search', '-s', help='Search by name or address')
@@ -1403,7 +1442,9 @@ COMMANDS = {
     'projects-update': cmd_projects_update,
     'boards': cmd_boards,
     'columns': cmd_columns,
+    'columns-create': cmd_columns_create,
     'comments': cmd_comments,
+    'projects-create': cmd_projects_create,
     'contract-types': cmd_contract_types,
     'contract-templates': cmd_contract_templates,
     'clients': cmd_clients,
