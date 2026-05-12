@@ -99,7 +99,12 @@ def _save_config(cfg: dict) -> None:
     os.chmod(CONFIG_FILE, 0o600)
 
 
+_PAT_OVERRIDE: str = ""  # set by main() when --pat / --pat-env is supplied
+
+
 def _get_pat() -> str:
+    if _PAT_OVERRIDE:
+        return _PAT_OVERRIDE
     pat = os.environ.get('C2_PAT', '') or _load_config().get('pat', '')
     if not pat:
         _err('No PAT configured. Set C2_PAT env var or run: tark config set pat <token>')
@@ -1371,6 +1376,14 @@ def build_parser() -> argparse.ArgumentParser:
         help='Skip the LLM safety screen on untrusted text (wiki/task/comments). '
              'Default-on when CLAUDECODE / DOT_HEADLESS / TARK_SAFETY_CHECK=1 is set.',
     )
+    parser.add_argument(
+        '--pat',
+        help='Explicit C2 PAT (overrides env + config file)',
+    )
+    parser.add_argument(
+        '--pat-env', dest='pat_env',
+        help='Env var name to read PAT from (overrides default C2_PAT)',
+    )
     sub = parser.add_subparsers(dest='command')
 
     # status
@@ -1633,8 +1646,18 @@ COMMANDS = {
 
 
 def main():
+    global _PAT_OVERRIDE
     parser = build_parser()
     args = parser.parse_args()
+
+    # Resolve PAT override: --pat > --pat-env > C2_PAT env > config.json
+    if args.pat:
+        _PAT_OVERRIDE = args.pat
+    elif args.pat_env:
+        val = os.environ.get(args.pat_env, '')
+        if not val:
+            _err(f'--pat-env {args.pat_env!r} is set but the env var is empty or unset')
+        _PAT_OVERRIDE = val
 
     if not args.command:
         # Default: show status
