@@ -24,8 +24,12 @@ except ImportError:
     fcntl = None
     _HAS_FCNTL = False
 
-_DEFAULT_TTL_SEC = 900
-_DEFAULT_CAP = 1000
+# Long TTL is safe: cache key is SHA-256(model + mode + title + body), so any
+# content edit changes the key and any model swap (via SAFETY_CHECK_MODEL)
+# invalidates prior verdicts. 30 days roughly tracks gemini-cli's default-model
+# version cadence; override via TARK_SAFETY_CACHE_TTL_SEC for stricter runs.
+_DEFAULT_TTL_SEC = 30 * 24 * 60 * 60  # 30 days (was 15 min)
+_DEFAULT_CAP = 10_000  # ~1.1 MB on disk at ~110 B/entry (was 1000)
 
 
 def _cache_path() -> Path:

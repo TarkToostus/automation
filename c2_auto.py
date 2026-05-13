@@ -176,8 +176,13 @@ def cmd_create(args: argparse.Namespace) -> None:
     if not subject:
         die("create: subject required", rc=1)
 
+    # Pass project + board by ID (stable) rather than name. The "Sidecar" board
+    # was renamed to "c2-auto" 2026-05-13; the "Autopilot" project could be
+    # renamed too. IDs stay. If either ever moves, bump the constants at the
+    # top of this file (SIDECAR_PROJECT_ID / SIDECAR_BOARD_ID).
     rc, out, err = run_cli(
-        "create", "Autopilot", subject, "--board", "Sidecar", json_mode=True
+        "create", str(SIDECAR_PROJECT_ID), subject,
+        "--board", str(SIDECAR_BOARD_ID), json_mode=True
     )
     if rc != 0:
         die(f"tark_cli create failed (rc={rc}): {err.strip() or out.strip()}", rc=1)

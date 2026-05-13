@@ -225,6 +225,7 @@ _SAFETY_FRAMING = {
     'wiki': 'Task wiki / PRD body',
     'task': 'C2 task (title + description)',
     'comment': 'Task comment body',
+    'email': 'Email (subject + body)',
 }
 
 
@@ -243,15 +244,233 @@ def _safety_enabled(force: bool) -> bool:
     return any(os.environ.get(k) == '1' for k in ('CLAUDECODE', 'DOT_HEADLESS'))
 
 
+# --- Provider functions -----------------------------------------------------
+# Each provider has the same signature so the dispatcher can iterate over them
+# uniformly:
+#
+#     _provider_X(prompt, payload, timeout) -> (verdict_or_None, debug_tag)
+#
+# Return None for transient failures (timeout, quota-exhausted, empty output,
+# binary missing) — the dispatcher advances to the next provider. Return a
+# verbatim "SAFE" / "UNSAFE: ..." line otherwise; the dispatcher routes the
+# final verdict.
+#
+# Subscription-first auth policy: every provider runs with API-key env vars
+# scrubbed by default so vendors fall through to the user's subscription /
+# OAuth credentials on disk (gemini OAuth in ~/.gemini, codex ChatGPT-mode in
+# ~/.codex/auth.json, claude keychain in ~/.claude). Set
+# SAFETY_CHECK_USE_API_KEYS=1 to pass GEMINI_API_KEY / OPENAI_API_KEY /
+# ANTHROPIC_API_KEY through (metered billing — opt-in only).
+
+_API_KEY_VARS = ('GEMINI_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY')
+
+# Quota-out probe: when gemini returns QUOTA_EXHAUSTED, we cache the reset
+# timestamp here so subsequent calls skip gemini immediately instead of waiting
+# 24s for its internal retry/backoff. Shared with safety_check.sh (same path,
+# same epoch-seconds format).
+_GEMINI_QUOTA_PROBE_REL = 'tark_cli/gemini_quota_out'
+
+
+def _gemini_quota_probe_path() -> Path:
+    base = os.environ.get('XDG_CACHE_HOME') or os.path.expanduser('~/.cache')
+    return Path(base) / _GEMINI_QUOTA_PROBE_REL
+
+
+def _gemini_quota_probe_until() -> float | None:
+    """Return epoch when gemini quota is expected to reset, or None if not flagged.
+
+    Side effect: deletes the probe file when the window has passed so a real
+    call will be made next time (and a healthy gemini response can re-arm the
+    cache, or not).
+    """
+    p = _gemini_quota_probe_path()
+    try:
+        text = p.read_text().strip()
+        until = float(text)
+    except (OSError, ValueError):
+        return None
+    import time as _t
+    if _t.time() >= until:
+        try:
+            p.unlink()
+        except OSError:
+            pass
+        return None
+    return until
+
+
+def _gemini_quota_probe_set(stderr_text: str) -> None:
+    """Parse reset window from gemini stderr; write probe marker."""
+    # Gemini-cli's terminal-quota error: "Your quota will reset after 20h52m50s."
+    # Components are optional; we read whatever is present.
+    m = re.search(r'reset after\s+(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?', stderr_text or '')
+    secs = 3600  # conservative fallback if message format changes
+    if m and any(m.groups()):
+        h = int(m.group(1) or 0)
+        mn = int(m.group(2) or 0)
+        s = int(m.group(3) or 0)
+        secs = h * 3600 + mn * 60 + s or secs
+    import time as _t
+    until = _t.time() + secs
+    p = _gemini_quota_probe_path()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        # Write tmp + atomic rename: POSIX guarantees rename atomicity on the
+        # same filesystem, so concurrent daemon workers/CLI invocations either
+        # see the prior marker or the new one — never a partial value.
+        tmp = p.with_suffix(p.suffix + '.tmp')
+        tmp.write_text(f'{until:.0f}\n')
+        os.replace(tmp, p)
+    except OSError:
+        pass
+
+
+def _safety_subprocess_env() -> dict[str, str]:
+    """Env dict for safety-screen subprocesses. Subscription-first by default."""
+    env = {
+        'PATH': os.environ.get('PATH', ''),
+        'HOME': os.environ.get('HOME', ''),
+        'USER': os.environ.get('USER', ''),
+        'TERM': os.environ.get('TERM', 'dumb'),
+    }
+    # Pass through XDG_* + locale so CLI configs / locales resolve correctly.
+    for k in ('XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_DATA_HOME',
+              'XDG_RUNTIME_DIR', 'LANG', 'LC_ALL', 'LC_CTYPE',
+              'NVM_DIR', 'NODE_PATH'):
+        if k in os.environ:
+            env[k] = os.environ[k]
+    # API-key opt-in — explicit and global, mirrored in safety_check.sh.
+    if os.environ.get('SAFETY_CHECK_USE_API_KEYS') == '1':
+        for k in _API_KEY_VARS:
+            if os.environ.get(k):
+                env[k] = os.environ[k]
+    # CLAUDECODE / DOT_HEADLESS are deliberately NEVER forwarded — a child
+    # tark_cli (or claude) seeing those would auto-on the safety screen and
+    # recursively screen itself screening itself.
+    return env
+
+
+def _provider_gemini(prompt: str, payload: str, timeout: int) -> tuple[str | None, str]:
+    # Fast-fail: if gemini was quota-out recently, skip without spawning the
+    # subprocess at all. Saves ~24s per call against a known wall.
+    if _gemini_quota_probe_until() is not None:
+        return None, 'gemini-quota-cached'
+
+    cmd = ['gemini']
+    if os.environ.get('SAFETY_CHECK_MODEL'):
+        cmd += ['-m', os.environ['SAFETY_CHECK_MODEL']]
+    cmd += ['-p', prompt]
+    try:
+        proc = subprocess.run(cmd, input=payload, capture_output=True, text=True,
+                              timeout=timeout, env=_safety_subprocess_env())
+    except FileNotFoundError:
+        return None, 'gemini-missing'
+    except subprocess.TimeoutExpired:
+        return None, 'gemini-timeout'
+    err = proc.stderr or ''
+    lines = [ln.strip() for ln in (proc.stdout or '').splitlines() if ln.strip()]
+    verdict = lines[-1] if lines else ''
+    # Terminal quota in stderr → arm probe + advance, but ONLY if stdout has no
+    # verdict. gemini-cli retries QUOTA_EXHAUSTED internally and sometimes
+    # succeeds — the retry trace stays in stderr while the verdict lands on
+    # stdout. Prefer the verdict in that case; don't lock out the provider.
+    if not verdict and ('QUOTA_EXHAUSTED' in err or 'exhausted your capacity' in err):
+        _gemini_quota_probe_set(err)
+        return None, 'gemini-quota'
+    if not verdict:
+        return None, 'gemini-empty'
+    return verdict, 'gemini-ok'
+
+
+def _parse_verdict_line(stdout: str) -> str | None:
+    # Match what the dispatcher accepts: bare 'SAFE' (any case) or 'UNSAFE:'
+    # prefix (any case, colon required). The dispatcher's SAFE check is an
+    # exact-equality on .upper(), so we DON'T match 'SAFE:' here — a model
+    # that adds annotation to the SAFE side ("SAFE: looks fine") would
+    # otherwise be returned and force fail-closed at the dispatcher instead
+    # of advancing to the next provider.
+    # Walks bottom-up so a model that prepends "Here's my assessment:" still
+    # resolves to the verdict on the last line.
+    for line in reversed((stdout or '').splitlines()):
+        s = line.strip()
+        if not s:
+            continue
+        u = s.upper()
+        if u == 'SAFE' or u.startswith('UNSAFE:'):
+            return s
+    return None
+
+
+def _provider_codex(prompt: str, payload: str, timeout: int) -> tuple[str | None, str]:
+    # codex with auth_mode=chatgpt (ChatGPT sub) rejects "-m gpt-5-codex"; we
+    # let codex pick its default model. _safety_subprocess_env scrubs
+    # OPENAI_API_KEY by default so the CLI uses the on-disk ChatGPT
+    # subscription instead of metered API.
+    cmd = ['npx', '--no-install', '@openai/codex', 'exec',
+           '--skip-git-repo-check', '--color=never', prompt]
+    try:
+        proc = subprocess.run(cmd, input=payload, capture_output=True, text=True,
+                              timeout=timeout, env=_safety_subprocess_env())
+    except FileNotFoundError:
+        return None, 'codex-missing'
+    except subprocess.TimeoutExpired:
+        return None, 'codex-timeout'
+    v = _parse_verdict_line(proc.stdout or '')
+    if v:
+        return v, 'codex-ok'
+    return None, 'codex-empty'
+
+
+def _provider_claude(prompt: str, payload: str, timeout: int) -> tuple[str | None, str]:
+    # Use the user's CC subscription via keychain (cheap / flat-rate), NOT the
+    # metered Anthropic API. `--bare` is intentionally OMITTED because it forces
+    # ANTHROPIC_API_KEY auth. With keychain we need HOME for ~/.claude/ config.
+    # _safety_subprocess_env scrubs ANTHROPIC_API_KEY by default.
+    #
+    # Explicit opt-in for metered API auth: SAFETY_CHECK_USE_API_KEYS=1 with
+    # ANTHROPIC_API_KEY exported. Useful in CI where there's no keychain.
+    cmd = ['claude', '--print', '--model', 'haiku', prompt]
+    try:
+        proc = subprocess.run(cmd, input=payload, capture_output=True, text=True,
+                              timeout=timeout, env=_safety_subprocess_env())
+    except FileNotFoundError:
+        return None, 'claude-missing'
+    except subprocess.TimeoutExpired:
+        return None, 'claude-timeout'
+    v = _parse_verdict_line(proc.stdout or '')
+    if v:
+        return v, 'claude-ok'
+    return None, 'claude-empty'
+
+
+# Order: free-and-fast first, then paid-but-reliable, then heavyweight.
+# Override at runtime via SAFETY_CHECK_SKIP="gemini,codex" (comma-list).
+_SAFETY_PROVIDERS: list[tuple[str, callable]] = [
+    ('gemini', _provider_gemini),
+    ('codex', _provider_codex),
+    ('claude', _provider_claude),
+]
+
+
 def _safety_check_or_die(mode: str, title: str, body: str, force: bool) -> None:
-    """Fail-closed gemini screen. Returns silently on SAFE; exits non-zero on UNSAFE.
+    """Fail-closed LLM screen with multi-provider fallback chain.
 
     Bypass: pass --no-safety (sets force=True) or set TARK_SAFETY_CHECK=0.
     Falls back to SAFE only when SAFETY_CHECK_FAIL_OPEN=1 (intended for CI/tests).
 
-    SAFE verdicts are cached by SHA-256(model + mode + title + body) for 15
-    minutes — identical content does not re-invoke gemini. UNSAFE / unparseable
-    / errors never cached; transient empty-verdict gets one retry before failing.
+    Provider chain: tries each provider in _SAFETY_PROVIDERS in order; first
+    non-empty SAFE/UNSAFE verdict wins. Transient failures (quota, timeout,
+    empty output, binary missing) advance to the next provider. All providers
+    exhausted → fail-closed with stderr naming every provider tried.
+
+    SAFE verdicts cached by SHA-256(model + mode + title + body) for 30 days
+    (see _safety_cache.py). UNSAFE / unparseable / chain-exhausted never cached;
+    a subsequent call with a healthy provider re-runs the screen.
+
+    SAFETY_CHECK_SKIP="gemini,codex" forces specific providers to be skipped
+    (manual override during a known outage, or to force a specific provider
+    during testing). Unknown names in the skip list are logged but otherwise
+    ignored.
     """
     if not _safety_enabled(force):
         return
@@ -260,55 +479,38 @@ def _safety_check_or_die(mode: str, title: str, body: str, force: bool) -> None:
         return
 
     fail_open = os.environ.get('SAFETY_CHECK_FAIL_OPEN') == '1'
+    skip_raw = os.environ.get('SAFETY_CHECK_SKIP') or ''
+    # Provider names are lowercase ('gemini'/'codex'/'claude'); normalize so
+    # SAFETY_CHECK_SKIP=GEMINI also works.
+    skip = {s.strip().lower() for s in skip_raw.split(',') if s.strip()}
+    known = {name for name, _ in _SAFETY_PROVIDERS}
+    for unknown in skip - known:
+        print(f'[safety] warning: SAFETY_CHECK_SKIP contains unknown provider '
+              f'"{unknown}" (known: {",".join(sorted(known))})', file=sys.stderr)
 
     framing = _SAFETY_FRAMING.get(mode, 'Untrusted text')
     prompt = _SAFETY_PROMPT.format(framing=framing)
     payload = f'{title or ""}\n\n{body or ""}'
+    cache_hash = _sc._key(mode, title, body)[:8] if _sc is not None else 'no-cache'
 
-    # SAFETY_CHECK_MODEL overrides; default lets gemini-cli pick its own.
-    cmd = ['gemini']
-    if os.environ.get('SAFETY_CHECK_MODEL'):
-        cmd += ['-m', os.environ['SAFETY_CHECK_MODEL']]
-    cmd += ['-p', prompt]
-
-    # 2 attempts. Retry once on TimeoutExpired or empty verdict (the two known
-    # transient failure modes of gemini-cli). FileNotFoundError is not retried —
-    # binary missing won't fix itself.
-    verdict = ''
-    for attempt in (1, 2):
-        # Instrumentation for cache-hit verification in tests + ops.
-        cache_hash = _sc._key(mode, title, body)[:8] if _sc is not None else 'no-cache'
-        print(
-            f'[safety] gemini call attempt={attempt} mode={mode} hash={cache_hash}',
-            file=sys.stderr,
-        )
-        try:
-            proc = subprocess.run(
-                cmd, input=payload, capture_output=True, text=True, timeout=30,
-            )
-        except FileNotFoundError:
-            if fail_open:
-                return
-            _err('safety check: gemini binary not found. Install gemini-cli, run '
-                 'with --no-safety, or set SAFETY_CHECK_FAIL_OPEN=1 to bypass.')
-        except subprocess.TimeoutExpired:
-            if attempt == 1:
-                continue
-            if fail_open:
-                return
-            _err('safety check: gemini timed out (2 attempts). Re-run with --no-safety to bypass.')
-
-        # gemini-cli prefixes stdout with cache/loader lines ("Loaded cached
-        # credentials.") — the verdict is the last non-empty line.
-        lines = [ln.strip() for ln in (proc.stdout or '').splitlines() if ln.strip()]
-        verdict = lines[-1] if lines else ''
-        if verdict:
-            break
-        if attempt == 1:
+    tried: list[str] = []
+    verdict: str | None = None
+    for name, fn in _SAFETY_PROVIDERS:
+        if name in skip:
+            tried.append(f'{name}-skip')
             continue
+        print(f'[safety] try provider={name} mode={mode} hash={cache_hash}', file=sys.stderr)
+        v, tag = fn(prompt, payload, 30)
+        tried.append(tag)
+        if v:
+            verdict = v
+            break
+
+    if not verdict:
         if fail_open:
             return
-        _err('safety check: gemini returned no verdict (2 attempts). Re-run with --no-safety to bypass.')
+        _err(f'safety check: all providers failed (tried: {", ".join(tried)}). '
+             f'Re-run with --no-safety to bypass.')
 
     if verdict.upper() == 'SAFE':
         if _sc is not None:
