@@ -433,7 +433,7 @@ def test_status_case_insensitive(stub_cli, capsys):
 
 def test_create_default_lands_on_idea(stub_cli, capsys):
     stub_cli.responses[
-        (True, "create", "Autopilot", "Add foo", "--board", "Sidecar")
+        (True, "create", "Autopilot", "Add foo", "--board", "48")
     ] = (0, json.dumps({"id": 9999, "column_name": "IDEA"}), "")
     rc = run_cmd("create", "Add", "foo")
     assert rc == 0
@@ -446,7 +446,7 @@ def test_create_default_lands_on_idea(stub_cli, capsys):
 
 def test_create_with_todo_moves_to_todo_column(stub_cli, capsys):
     stub_cli.responses[
-        (True, "create", "Autopilot", "Add foo", "--board", "Sidecar")
+        (True, "create", "Autopilot", "Add foo", "--board", "48")
     ] = (0, json.dumps({"id": 9999}), "")
     rc = run_cmd("create", "--todo", "Add", "foo")
     assert rc == 0
