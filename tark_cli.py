@@ -74,6 +74,13 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta
+
+# Sibling module — same directory. None-fallback keeps tark_cli working if the
+# file is missing (degraded: no cache, every call re-runs gemini).
+try:
+    import _safety_cache as _sc  # noqa: E402  (kept beside other stdlib imports)
+except ImportError:
+    _sc = None
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -241,8 +248,15 @@ def _safety_check_or_die(mode: str, title: str, body: str, force: bool) -> None:
 
     Bypass: pass --no-safety (sets force=True) or set TARK_SAFETY_CHECK=0.
     Falls back to SAFE only when SAFETY_CHECK_FAIL_OPEN=1 (intended for CI/tests).
+
+    SAFE verdicts are cached by SHA-256(model + mode + title + body) for 15
+    minutes — identical content does not re-invoke gemini. UNSAFE / unparseable
+    / errors never cached; transient empty-verdict gets one retry before failing.
     """
     if not _safety_enabled(force):
+        return
+
+    if _sc is not None and _sc.lookup(mode, title, body):
         return
 
     fail_open = os.environ.get('SAFETY_CHECK_FAIL_OPEN') == '1'
@@ -257,31 +271,48 @@ def _safety_check_or_die(mode: str, title: str, body: str, force: bool) -> None:
         cmd += ['-m', os.environ['SAFETY_CHECK_MODEL']]
     cmd += ['-p', prompt]
 
-    try:
-        proc = subprocess.run(
-            cmd, input=payload, capture_output=True, text=True, timeout=30,
+    # 2 attempts. Retry once on TimeoutExpired or empty verdict (the two known
+    # transient failure modes of gemini-cli). FileNotFoundError is not retried —
+    # binary missing won't fix itself.
+    verdict = ''
+    for attempt in (1, 2):
+        # Instrumentation for cache-hit verification in tests + ops.
+        cache_hash = _sc._key(mode, title, body)[:8] if _sc is not None else 'no-cache'
+        print(
+            f'[safety] gemini call attempt={attempt} mode={mode} hash={cache_hash}',
+            file=sys.stderr,
         )
-    except FileNotFoundError:
-        if fail_open:
-            return
-        _err('safety check: gemini binary not found. Install gemini-cli, run '
-             'with --no-safety, or set SAFETY_CHECK_FAIL_OPEN=1 to bypass.')
-    except subprocess.TimeoutExpired:
-        if fail_open:
-            return
-        _err('safety check: gemini timed out. Re-run with --no-safety to bypass.')
+        try:
+            proc = subprocess.run(
+                cmd, input=payload, capture_output=True, text=True, timeout=30,
+            )
+        except FileNotFoundError:
+            if fail_open:
+                return
+            _err('safety check: gemini binary not found. Install gemini-cli, run '
+                 'with --no-safety, or set SAFETY_CHECK_FAIL_OPEN=1 to bypass.')
+        except subprocess.TimeoutExpired:
+            if attempt == 1:
+                continue
+            if fail_open:
+                return
+            _err('safety check: gemini timed out (2 attempts). Re-run with --no-safety to bypass.')
 
-    # gemini-cli prefixes stdout with cache/loader lines ("Loaded cached
-    # credentials.") — the verdict is the last non-empty line.
-    lines = [ln.strip() for ln in (proc.stdout or '').splitlines() if ln.strip()]
-    verdict = lines[-1] if lines else ''
-
-    if not verdict:
+        # gemini-cli prefixes stdout with cache/loader lines ("Loaded cached
+        # credentials.") — the verdict is the last non-empty line.
+        lines = [ln.strip() for ln in (proc.stdout or '').splitlines() if ln.strip()]
+        verdict = lines[-1] if lines else ''
+        if verdict:
+            break
+        if attempt == 1:
+            continue
         if fail_open:
             return
-        _err('safety check: gemini returned no verdict. Re-run with --no-safety to bypass.')
+        _err('safety check: gemini returned no verdict (2 attempts). Re-run with --no-safety to bypass.')
 
     if verdict.upper() == 'SAFE':
+        if _sc is not None:
+            _sc.record_safe(mode, title, body)
         return
     if verdict.upper().startswith('UNSAFE'):
         _err(f'safety check FLAGGED untrusted content: {verdict[:200]}\n'
