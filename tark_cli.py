@@ -253,24 +253,120 @@ def _safety_enabled(force: bool) -> bool:
 # binary missing) — the dispatcher advances to the next provider. Return a
 # verbatim "SAFE" / "UNSAFE: ..." line otherwise; the dispatcher routes the
 # final verdict.
+#
+# Subscription-first auth policy: every provider runs with API-key env vars
+# scrubbed by default so vendors fall through to the user's subscription /
+# OAuth credentials on disk (gemini OAuth in ~/.gemini, codex ChatGPT-mode in
+# ~/.codex/auth.json, claude keychain in ~/.claude). Set
+# SAFETY_CHECK_USE_API_KEYS=1 to pass GEMINI_API_KEY / OPENAI_API_KEY /
+# ANTHROPIC_API_KEY through (metered billing — opt-in only).
+
+_API_KEY_VARS = ('GEMINI_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY')
+
+# Quota-out probe: when gemini returns QUOTA_EXHAUSTED, we cache the reset
+# timestamp here so subsequent calls skip gemini immediately instead of waiting
+# 24s for its internal retry/backoff. Shared with safety_check.sh (same path,
+# same epoch-seconds format).
+_GEMINI_QUOTA_PROBE_REL = 'tark_cli/gemini_quota_out'
+
+
+def _gemini_quota_probe_path() -> Path:
+    base = os.environ.get('XDG_CACHE_HOME') or os.path.expanduser('~/.cache')
+    return Path(base) / _GEMINI_QUOTA_PROBE_REL
+
+
+def _gemini_quota_probe_until() -> float | None:
+    """Return epoch when gemini quota is expected to reset, or None if not flagged.
+
+    Side effect: deletes the probe file when the window has passed so a real
+    call will be made next time (and a healthy gemini response can re-arm the
+    cache, or not).
+    """
+    p = _gemini_quota_probe_path()
+    try:
+        text = p.read_text().strip()
+        until = float(text)
+    except (OSError, ValueError):
+        return None
+    import time as _t
+    if _t.time() >= until:
+        try:
+            p.unlink()
+        except OSError:
+            pass
+        return None
+    return until
+
+
+def _gemini_quota_probe_set(stderr_text: str) -> None:
+    """Parse reset window from gemini stderr; write probe marker."""
+    # Gemini-cli's terminal-quota error: "Your quota will reset after 20h52m50s."
+    # Components are optional; we read whatever is present.
+    m = re.search(r'reset after\s+(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?', stderr_text or '')
+    secs = 3600  # conservative fallback if message format changes
+    if m and any(m.groups()):
+        h = int(m.group(1) or 0)
+        mn = int(m.group(2) or 0)
+        s = int(m.group(3) or 0)
+        secs = h * 3600 + mn * 60 + s or secs
+    import time as _t
+    until = _t.time() + secs
+    p = _gemini_quota_probe_path()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f'{until:.0f}\n')
+    except OSError:
+        pass
+
+
+def _safety_subprocess_env() -> dict[str, str]:
+    """Env dict for safety-screen subprocesses. Subscription-first by default."""
+    env = {
+        'PATH': os.environ.get('PATH', ''),
+        'HOME': os.environ.get('HOME', ''),
+        'USER': os.environ.get('USER', ''),
+        'TERM': os.environ.get('TERM', 'dumb'),
+    }
+    # Pass through XDG_* + locale so CLI configs / locales resolve correctly.
+    for k in ('XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_DATA_HOME',
+              'XDG_RUNTIME_DIR', 'LANG', 'LC_ALL', 'LC_CTYPE',
+              'NVM_DIR', 'NODE_PATH'):
+        if k in os.environ:
+            env[k] = os.environ[k]
+    # API-key opt-in — explicit and global, mirrored in safety_check.sh.
+    if os.environ.get('SAFETY_CHECK_USE_API_KEYS') == '1':
+        for k in _API_KEY_VARS:
+            if os.environ.get(k):
+                env[k] = os.environ[k]
+    # CLAUDECODE / DOT_HEADLESS are deliberately NEVER forwarded — a child
+    # tark_cli (or claude) seeing those would auto-on the safety screen and
+    # recursively screen itself screening itself.
+    return env
 
 
 def _provider_gemini(prompt: str, payload: str, timeout: int) -> tuple[str | None, str]:
+    # Fast-fail: if gemini was quota-out recently, skip without spawning the
+    # subprocess at all. Saves ~24s per call against a known wall.
+    if _gemini_quota_probe_until() is not None:
+        return None, 'gemini-quota-cached'
+
     cmd = ['gemini']
     if os.environ.get('SAFETY_CHECK_MODEL'):
         cmd += ['-m', os.environ['SAFETY_CHECK_MODEL']]
     cmd += ['-p', prompt]
     try:
-        proc = subprocess.run(cmd, input=payload, capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run(cmd, input=payload, capture_output=True, text=True,
+                              timeout=timeout, env=_safety_subprocess_env())
     except FileNotFoundError:
         return None, 'gemini-missing'
     except subprocess.TimeoutExpired:
         return None, 'gemini-timeout'
     err = proc.stderr or ''
     # Distinguish terminal quota exhaustion from transient flake so the chain
-    # advances immediately (and so callers can log "gemini down for ~Nh" rather
-    # than "gemini empty, retrying").
+    # advances immediately AND cache the reset window so the next call doesn't
+    # pay the 24s gemini-internal retry again.
     if 'QUOTA_EXHAUSTED' in err or 'exhausted your capacity' in err:
+        _gemini_quota_probe_set(err)
         return None, 'gemini-quota'
     lines = [ln.strip() for ln in (proc.stdout or '').splitlines() if ln.strip()]
     verdict = lines[-1] if lines else ''
@@ -280,13 +376,15 @@ def _provider_gemini(prompt: str, payload: str, timeout: int) -> tuple[str | Non
 
 
 def _provider_codex(prompt: str, payload: str, timeout: int) -> tuple[str | None, str]:
-    # ChatGPT-account auth rejects "-m gpt-5-codex"; use codex's default model.
-    # Override via OPENAI_API_KEY + SAFETY_CHECK_CODEX_MODEL if an API-key user
-    # wants pinning (not honored by default to keep behavior predictable).
+    # codex with auth_mode=chatgpt (ChatGPT sub) rejects "-m gpt-5-codex"; we
+    # let codex pick its default model. _safety_subprocess_env scrubs
+    # OPENAI_API_KEY by default so the CLI uses the on-disk ChatGPT
+    # subscription instead of metered API.
     cmd = ['npx', '--no-install', '@openai/codex', 'exec',
            '--skip-git-repo-check', '--color=never', prompt]
     try:
-        proc = subprocess.run(cmd, input=payload, capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run(cmd, input=payload, capture_output=True, text=True,
+                              timeout=timeout, env=_safety_subprocess_env())
     except FileNotFoundError:
         return None, 'codex-missing'
     except subprocess.TimeoutExpired:
@@ -301,21 +399,17 @@ def _provider_codex(prompt: str, payload: str, timeout: int) -> tuple[str | None
 
 
 def _provider_claude(prompt: str, payload: str, timeout: int) -> tuple[str | None, str]:
-    # `--bare` skips hooks, CLAUDE.md, keychain — essential to avoid inheriting
-    # the parent CC session's auto-memory/skills. We further sanitize env so a
-    # parent CLAUDECODE=1 / DOT_HEADLESS=1 doesn't sneak in (the child would
-    # then think IT is the auto-on agent and recurse).
-    cmd = ['claude', '--bare', '--print', '--model', 'haiku', prompt]
-    safe_env = {
-        'PATH': os.environ.get('PATH', ''),
-        'HOME': os.environ.get('HOME', ''),
-    }
-    # Pass API key only if explicitly set (don't leak parent auth state).
-    if os.environ.get('ANTHROPIC_API_KEY'):
-        safe_env['ANTHROPIC_API_KEY'] = os.environ['ANTHROPIC_API_KEY']
+    # Use the user's CC subscription via keychain (cheap / flat-rate), NOT the
+    # metered Anthropic API. `--bare` is intentionally OMITTED because it forces
+    # ANTHROPIC_API_KEY auth. With keychain we need HOME for ~/.claude/ config.
+    # _safety_subprocess_env scrubs ANTHROPIC_API_KEY by default.
+    #
+    # Explicit opt-in for metered API auth: SAFETY_CHECK_USE_API_KEYS=1 with
+    # ANTHROPIC_API_KEY exported. Useful in CI where there's no keychain.
+    cmd = ['claude', '--print', '--model', 'haiku', prompt]
     try:
         proc = subprocess.run(cmd, input=payload, capture_output=True, text=True,
-                              timeout=timeout, env=safe_env)
+                              timeout=timeout, env=_safety_subprocess_env())
     except FileNotFoundError:
         return None, 'claude-missing'
     except subprocess.TimeoutExpired:

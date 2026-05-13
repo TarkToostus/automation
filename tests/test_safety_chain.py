@@ -190,6 +190,77 @@ class SafetyChainTests(unittest.TestCase):
             self.tark._safety_check_or_die('wiki', 't', 'b11', force=False)
 
 
+class GeminiQuotaProbeTests(unittest.TestCase):
+    """Probe-cache short-circuits gemini calls after a QUOTA_EXHAUSTED detection.
+
+    Without the probe, gemini-cli pays ~24s of internal retry/backoff before
+    falling through to the chain advance. The probe caches the reset window so
+    subsequent calls skip gemini at the provider-function level.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        os.environ['XDG_CACHE_HOME'] = self._tmp.name
+        sys.modules.pop('tark_cli', None)
+        self.tark = importlib.import_module('tark_cli')
+
+    def tearDown(self):
+        self._tmp.cleanup()
+        os.environ.pop('XDG_CACHE_HOME', None)
+
+    def test_no_probe_returns_none(self):
+        self.assertIsNone(self.tark._gemini_quota_probe_until())
+
+    def test_arm_then_read_returns_future(self):
+        import time as _t
+        self.tark._gemini_quota_probe_set('Your quota will reset after 0h0m30s.')
+        until = self.tark._gemini_quota_probe_until()
+        self.assertIsNotNone(until)
+        self.assertGreater(until, _t.time())
+        self.assertLess(until, _t.time() + 60)
+
+    def test_expired_probe_is_cleared(self):
+        # Write a marker in the past — read should return None AND unlink.
+        p = self.tark._gemini_quota_probe_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text('0\n')
+        self.assertIsNone(self.tark._gemini_quota_probe_until())
+        self.assertFalse(p.exists())
+
+    def test_parse_h_m_s(self):
+        self.tark._gemini_quota_probe_set('reset after 1h2m3s')
+        import time as _t
+        until = self.tark._gemini_quota_probe_until()
+        delta = until - _t.time()
+        self.assertGreater(delta, 3700)  # >= 1h + 2m + 3s minus tolerance
+        self.assertLess(delta, 3800)
+
+    def test_parse_partial_window(self):
+        # gemini message may say just "30m" or "45s" — both should parse.
+        self.tark._gemini_quota_probe_set('reset after 30m')
+        import time as _t
+        until = self.tark._gemini_quota_probe_until()
+        delta = until - _t.time()
+        self.assertGreater(delta, 1700)
+        self.assertLess(delta, 1900)
+
+    def test_unparseable_message_falls_back_to_1h(self):
+        # If gemini changes its message format, we still want a probe armed.
+        self.tark._gemini_quota_probe_set('Some unrelated error text.')
+        import time as _t
+        until = self.tark._gemini_quota_probe_until()
+        delta = until - _t.time()
+        self.assertGreater(delta, 3500)
+        self.assertLess(delta, 3700)
+
+    def test_provider_gemini_short_circuits_when_probe_armed(self):
+        self.tark._gemini_quota_probe_set('reset after 1h')
+        with mock.patch('subprocess.run', side_effect=AssertionError('must not spawn gemini')):
+            verdict, tag = self.tark._provider_gemini('prompt', 'payload', 30)
+        self.assertIsNone(verdict)
+        self.assertEqual(tag, 'gemini-quota-cached')
+
+
 class SafetyCacheDefaultsTests(unittest.TestCase):
     """The cache constants moved to 30d / 10k — verify the new defaults."""
 
