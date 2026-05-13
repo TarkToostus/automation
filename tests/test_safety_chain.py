@@ -446,5 +446,32 @@ class SafetyCacheDefaultsTests(unittest.TestCase):
         self.assertEqual(self.sc._DEFAULT_CAP, 10_000)
 
 
+class FramingTableTests(unittest.TestCase):
+    """All four modes (wiki/task/comment/email) must map to a distinct framing
+    string so the prompt fed to providers is mode-appropriate AND the
+    SHA256(model+mode+title+body) cache key collides across the Python/bash
+    implementations for the same content.
+    """
+
+    def setUp(self):
+        sys.modules.pop('tark_cli', None)
+        self.tark = importlib.import_module('tark_cli')
+
+    def test_all_four_modes_have_distinct_framings(self):
+        framings = self.tark._SAFETY_FRAMING
+        for mode in ('wiki', 'task', 'comment', 'email'):
+            self.assertIn(mode, framings, f'mode {mode!r} missing from _SAFETY_FRAMING')
+        self.assertEqual(len(set(framings.values())), len(framings),
+                         'each mode must have a distinct framing string')
+
+    def test_email_framing_matches_bash(self):
+        # Keep in sync with safety_check.sh case statement (email branch).
+        self.assertEqual(self.tark._SAFETY_FRAMING['email'], 'Email (subject + body)')
+
+    def test_task_framing_matches_bash(self):
+        # Keep in sync with safety_check.sh case statement (task branch).
+        self.assertEqual(self.tark._SAFETY_FRAMING['task'], 'C2 task (title + description)')
+
+
 if __name__ == '__main__':
     unittest.main()
