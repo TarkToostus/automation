@@ -383,9 +383,12 @@ def _provider_gemini(prompt: str, payload: str, timeout: int) -> tuple[str | Non
 
 
 def _parse_verdict_line(stdout: str) -> str | None:
-    # Strict-match the protocol: bare 'SAFE' (any case) or a 'SAFE:' / 'UNSAFE:'
-    # prefix (any case, colon required). Rejects 'SAFEGUARDS', preamble lines,
-    # and code-fence wrappers that startswith() alone would mis-match.
+    # Match what the dispatcher accepts: bare 'SAFE' (any case) or 'UNSAFE:'
+    # prefix (any case, colon required). The dispatcher's SAFE check is an
+    # exact-equality on .upper(), so we DON'T match 'SAFE:' here — a model
+    # that adds annotation to the SAFE side ("SAFE: looks fine") would
+    # otherwise be returned and force fail-closed at the dispatcher instead
+    # of advancing to the next provider.
     # Walks bottom-up so a model that prepends "Here's my assessment:" still
     # resolves to the verdict on the last line.
     for line in reversed((stdout or '').splitlines()):
@@ -393,7 +396,7 @@ def _parse_verdict_line(stdout: str) -> str | None:
         if not s:
             continue
         u = s.upper()
-        if u == 'SAFE' or u.startswith('SAFE:') or u.startswith('UNSAFE:'):
+        if u == 'SAFE' or u.startswith('UNSAFE:'):
             return s
     return None
 
@@ -477,7 +480,9 @@ def _safety_check_or_die(mode: str, title: str, body: str, force: bool) -> None:
 
     fail_open = os.environ.get('SAFETY_CHECK_FAIL_OPEN') == '1'
     skip_raw = os.environ.get('SAFETY_CHECK_SKIP') or ''
-    skip = {s.strip() for s in skip_raw.split(',') if s.strip()}
+    # Provider names are lowercase ('gemini'/'codex'/'claude'); normalize so
+    # SAFETY_CHECK_SKIP=GEMINI also works.
+    skip = {s.strip().lower() for s in skip_raw.split(',') if s.strip()}
     known = {name for name, _ in _SAFETY_PROVIDERS}
     for unknown in skip - known:
         print(f'[safety] warning: SAFETY_CHECK_SKIP contains unknown provider '

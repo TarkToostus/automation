@@ -119,6 +119,19 @@ class SafetyChainTests(unittest.TestCase):
             self.tark._safety_check_or_die('wiki', 't', 'b5', force=False)
         codex_mock.assert_called_once()
 
+    def test_5b_skip_is_case_insensitive(self):
+        # User intent vs behavior: SAFETY_CHECK_SKIP=GEMINI should skip gemini,
+        # not warn "unknown provider" and run gemini anyway.
+        os.environ['SAFETY_CHECK_SKIP'] = 'GEMINI'
+        codex_mock = mock.Mock(return_value=('SAFE', 'codex-ok'))
+        with self._patch_providers(
+            mock.Mock(side_effect=AssertionError('gemini must be skipped (case)')),
+            codex_mock,
+            mock.Mock(side_effect=AssertionError('claude must not be called')),
+        ):
+            self.tark._safety_check_or_die('wiki', 't', 'b5b', force=False)
+        codex_mock.assert_called_once()
+
     def test_6_skip_all_fails_closed(self):
         os.environ['SAFETY_CHECK_SKIP'] = 'gemini,codex,claude'
         with self._patch_providers(
@@ -329,6 +342,19 @@ class ProviderParserTests(unittest.TestCase):
         # Bare 'UNSAFE' isn't a valid verdict per the prompt protocol — the
         # answer must be 'UNSAFE: <reason>'. Strict match.
         with mock.patch('subprocess.run', return_value=self._proc(stdout='UNSAFE\n')):
+            v, tag = self.tark._provider_codex('p', 'pay', 30)
+        self.assertIsNone(v)
+        self.assertEqual(tag, 'codex-empty')
+
+    def test_codex_rejects_safe_with_colon_annotation(self):
+        # Parser/dispatcher consistency: the dispatcher uses exact-equality on
+        # .upper() for the SAFE side, so "SAFE: looks fine" would be matched by
+        # the parser but rejected by the dispatcher → fail-closed instead of
+        # chain-advance. Parser must reject SAFE-with-colon for the chain to
+        # advance to the next provider.
+        with mock.patch('subprocess.run', return_value=self._proc(
+            stdout='SAFE: looks fine\n',
+        )):
             v, tag = self.tark._provider_codex('p', 'pay', 30)
         self.assertIsNone(v)
         self.assertEqual(tag, 'codex-empty')
