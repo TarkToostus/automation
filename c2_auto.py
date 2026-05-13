@@ -41,7 +41,8 @@ SIDECAR_PROJECT_ID = 28
 SIDECAR_BOARD_ID = 48
 
 # Hardcoded column IDs (board 48, defaults from orchestrator/runners/proof/c2_poller.py).
-# Stable in production; env overrides are for test environments only.
+# Stable in production. If C2 ever rebuilds the board these need bumping in lockstep
+# with the daemon's c2_poller.py constants.
 COLUMN_IDS = {
     "IDEA": 226,
     "TODO": 227,
