@@ -243,15 +243,120 @@ def _safety_enabled(force: bool) -> bool:
     return any(os.environ.get(k) == '1' for k in ('CLAUDECODE', 'DOT_HEADLESS'))
 
 
+# --- Provider functions -----------------------------------------------------
+# Each provider has the same signature so the dispatcher can iterate over them
+# uniformly:
+#
+#     _provider_X(prompt, payload, timeout) -> (verdict_or_None, debug_tag)
+#
+# Return None for transient failures (timeout, quota-exhausted, empty output,
+# binary missing) — the dispatcher advances to the next provider. Return a
+# verbatim "SAFE" / "UNSAFE: ..." line otherwise; the dispatcher routes the
+# final verdict.
+
+
+def _provider_gemini(prompt: str, payload: str, timeout: int) -> tuple[str | None, str]:
+    cmd = ['gemini']
+    if os.environ.get('SAFETY_CHECK_MODEL'):
+        cmd += ['-m', os.environ['SAFETY_CHECK_MODEL']]
+    cmd += ['-p', prompt]
+    try:
+        proc = subprocess.run(cmd, input=payload, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        return None, 'gemini-missing'
+    except subprocess.TimeoutExpired:
+        return None, 'gemini-timeout'
+    err = proc.stderr or ''
+    # Distinguish terminal quota exhaustion from transient flake so the chain
+    # advances immediately (and so callers can log "gemini down for ~Nh" rather
+    # than "gemini empty, retrying").
+    if 'QUOTA_EXHAUSTED' in err or 'exhausted your capacity' in err:
+        return None, 'gemini-quota'
+    lines = [ln.strip() for ln in (proc.stdout or '').splitlines() if ln.strip()]
+    verdict = lines[-1] if lines else ''
+    if not verdict:
+        return None, 'gemini-empty'
+    return verdict, 'gemini-ok'
+
+
+def _provider_codex(prompt: str, payload: str, timeout: int) -> tuple[str | None, str]:
+    # ChatGPT-account auth rejects "-m gpt-5-codex"; use codex's default model.
+    # Override via OPENAI_API_KEY + SAFETY_CHECK_CODEX_MODEL if an API-key user
+    # wants pinning (not honored by default to keep behavior predictable).
+    cmd = ['npx', '--no-install', '@openai/codex', 'exec',
+           '--skip-git-repo-check', '--color=never', prompt]
+    try:
+        proc = subprocess.run(cmd, input=payload, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        return None, 'codex-missing'
+    except subprocess.TimeoutExpired:
+        return None, 'codex-timeout'
+    # codex emits hook/session header lines + "codex" prefix line + verdict.
+    # Walk lines bottom-up; first line that starts SAFE/UNSAFE is the answer.
+    for line in reversed((proc.stdout or '').splitlines()):
+        s = line.strip()
+        if s.upper().startswith(('SAFE', 'UNSAFE')):
+            return s, 'codex-ok'
+    return None, 'codex-empty'
+
+
+def _provider_claude(prompt: str, payload: str, timeout: int) -> tuple[str | None, str]:
+    # `--bare` skips hooks, CLAUDE.md, keychain — essential to avoid inheriting
+    # the parent CC session's auto-memory/skills. We further sanitize env so a
+    # parent CLAUDECODE=1 / DOT_HEADLESS=1 doesn't sneak in (the child would
+    # then think IT is the auto-on agent and recurse).
+    cmd = ['claude', '--bare', '--print', '--model', 'haiku', prompt]
+    safe_env = {
+        'PATH': os.environ.get('PATH', ''),
+        'HOME': os.environ.get('HOME', ''),
+    }
+    # Pass API key only if explicitly set (don't leak parent auth state).
+    if os.environ.get('ANTHROPIC_API_KEY'):
+        safe_env['ANTHROPIC_API_KEY'] = os.environ['ANTHROPIC_API_KEY']
+    try:
+        proc = subprocess.run(cmd, input=payload, capture_output=True, text=True,
+                              timeout=timeout, env=safe_env)
+    except FileNotFoundError:
+        return None, 'claude-missing'
+    except subprocess.TimeoutExpired:
+        return None, 'claude-timeout'
+    out = (proc.stdout or '').strip()
+    if not out:
+        return None, 'claude-empty'
+    first = out.splitlines()[0].strip()
+    if first.upper().startswith(('SAFE', 'UNSAFE')):
+        return first, 'claude-ok'
+    return None, 'claude-empty'
+
+
+# Order: free-and-fast first, then paid-but-reliable, then heavyweight.
+# Override at runtime via SAFETY_CHECK_SKIP="gemini,codex" (comma-list).
+_SAFETY_PROVIDERS: list[tuple[str, callable]] = [
+    ('gemini', _provider_gemini),
+    ('codex', _provider_codex),
+    ('claude', _provider_claude),
+]
+
+
 def _safety_check_or_die(mode: str, title: str, body: str, force: bool) -> None:
-    """Fail-closed gemini screen. Returns silently on SAFE; exits non-zero on UNSAFE.
+    """Fail-closed LLM screen with multi-provider fallback chain.
 
     Bypass: pass --no-safety (sets force=True) or set TARK_SAFETY_CHECK=0.
     Falls back to SAFE only when SAFETY_CHECK_FAIL_OPEN=1 (intended for CI/tests).
 
-    SAFE verdicts are cached by SHA-256(model + mode + title + body) for 15
-    minutes — identical content does not re-invoke gemini. UNSAFE / unparseable
-    / errors never cached; transient empty-verdict gets one retry before failing.
+    Provider chain: tries each provider in _SAFETY_PROVIDERS in order; first
+    non-empty SAFE/UNSAFE verdict wins. Transient failures (quota, timeout,
+    empty output, binary missing) advance to the next provider. All providers
+    exhausted → fail-closed with stderr naming every provider tried.
+
+    SAFE verdicts cached by SHA-256(model + mode + title + body) for 30 days
+    (see _safety_cache.py). UNSAFE / unparseable / chain-exhausted never cached;
+    a subsequent call with a healthy provider re-runs the screen.
+
+    SAFETY_CHECK_SKIP="gemini,codex" forces specific providers to be skipped
+    (manual override during a known outage, or to force a specific provider
+    during testing). Unknown names in the skip list are logged but otherwise
+    ignored.
     """
     if not _safety_enabled(force):
         return
@@ -260,55 +365,36 @@ def _safety_check_or_die(mode: str, title: str, body: str, force: bool) -> None:
         return
 
     fail_open = os.environ.get('SAFETY_CHECK_FAIL_OPEN') == '1'
+    skip_raw = os.environ.get('SAFETY_CHECK_SKIP') or ''
+    skip = {s.strip() for s in skip_raw.split(',') if s.strip()}
+    known = {name for name, _ in _SAFETY_PROVIDERS}
+    for unknown in skip - known:
+        print(f'[safety] warning: SAFETY_CHECK_SKIP contains unknown provider '
+              f'"{unknown}" (known: {",".join(sorted(known))})', file=sys.stderr)
 
     framing = _SAFETY_FRAMING.get(mode, 'Untrusted text')
     prompt = _SAFETY_PROMPT.format(framing=framing)
     payload = f'{title or ""}\n\n{body or ""}'
+    cache_hash = _sc._key(mode, title, body)[:8] if _sc is not None else 'no-cache'
 
-    # SAFETY_CHECK_MODEL overrides; default lets gemini-cli pick its own.
-    cmd = ['gemini']
-    if os.environ.get('SAFETY_CHECK_MODEL'):
-        cmd += ['-m', os.environ['SAFETY_CHECK_MODEL']]
-    cmd += ['-p', prompt]
-
-    # 2 attempts. Retry once on TimeoutExpired or empty verdict (the two known
-    # transient failure modes of gemini-cli). FileNotFoundError is not retried —
-    # binary missing won't fix itself.
-    verdict = ''
-    for attempt in (1, 2):
-        # Instrumentation for cache-hit verification in tests + ops.
-        cache_hash = _sc._key(mode, title, body)[:8] if _sc is not None else 'no-cache'
-        print(
-            f'[safety] gemini call attempt={attempt} mode={mode} hash={cache_hash}',
-            file=sys.stderr,
-        )
-        try:
-            proc = subprocess.run(
-                cmd, input=payload, capture_output=True, text=True, timeout=30,
-            )
-        except FileNotFoundError:
-            if fail_open:
-                return
-            _err('safety check: gemini binary not found. Install gemini-cli, run '
-                 'with --no-safety, or set SAFETY_CHECK_FAIL_OPEN=1 to bypass.')
-        except subprocess.TimeoutExpired:
-            if attempt == 1:
-                continue
-            if fail_open:
-                return
-            _err('safety check: gemini timed out (2 attempts). Re-run with --no-safety to bypass.')
-
-        # gemini-cli prefixes stdout with cache/loader lines ("Loaded cached
-        # credentials.") — the verdict is the last non-empty line.
-        lines = [ln.strip() for ln in (proc.stdout or '').splitlines() if ln.strip()]
-        verdict = lines[-1] if lines else ''
-        if verdict:
-            break
-        if attempt == 1:
+    tried: list[str] = []
+    verdict: str | None = None
+    for name, fn in _SAFETY_PROVIDERS:
+        if name in skip:
+            tried.append(f'{name}-skip')
             continue
+        print(f'[safety] try provider={name} mode={mode} hash={cache_hash}', file=sys.stderr)
+        v, tag = fn(prompt, payload, 30)
+        tried.append(tag)
+        if v:
+            verdict = v
+            break
+
+    if not verdict:
         if fail_open:
             return
-        _err('safety check: gemini returned no verdict (2 attempts). Re-run with --no-safety to bypass.')
+        _err(f'safety check: all providers failed (tried: {", ".join(tried)}). '
+             f'Re-run with --no-safety to bypass.')
 
     if verdict.upper() == 'SAFE':
         if _sc is not None:
