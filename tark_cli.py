@@ -225,6 +225,7 @@ _SAFETY_FRAMING = {
     'wiki': 'Task wiki / PRD body',
     'task': 'C2 task (title + description)',
     'comment': 'Task comment body',
+    'email': 'Email (subject + body)',
 }
 
 
@@ -314,7 +315,12 @@ def _gemini_quota_probe_set(stderr_text: str) -> None:
     p = _gemini_quota_probe_path()
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(f'{until:.0f}\n')
+        # Write tmp + atomic rename: POSIX guarantees rename atomicity on the
+        # same filesystem, so concurrent daemon workers/CLI invocations either
+        # see the prior marker or the new one — never a partial value.
+        tmp = p.with_suffix(p.suffix + '.tmp')
+        tmp.write_text(f'{until:.0f}\n')
+        os.replace(tmp, p)
     except OSError:
         pass
 
@@ -362,17 +368,34 @@ def _provider_gemini(prompt: str, payload: str, timeout: int) -> tuple[str | Non
     except subprocess.TimeoutExpired:
         return None, 'gemini-timeout'
     err = proc.stderr or ''
-    # Distinguish terminal quota exhaustion from transient flake so the chain
-    # advances immediately AND cache the reset window so the next call doesn't
-    # pay the 24s gemini-internal retry again.
-    if 'QUOTA_EXHAUSTED' in err or 'exhausted your capacity' in err:
-        _gemini_quota_probe_set(err)
-        return None, 'gemini-quota'
     lines = [ln.strip() for ln in (proc.stdout or '').splitlines() if ln.strip()]
     verdict = lines[-1] if lines else ''
+    # Terminal quota in stderr → arm probe + advance, but ONLY if stdout has no
+    # verdict. gemini-cli retries QUOTA_EXHAUSTED internally and sometimes
+    # succeeds — the retry trace stays in stderr while the verdict lands on
+    # stdout. Prefer the verdict in that case; don't lock out the provider.
+    if not verdict and ('QUOTA_EXHAUSTED' in err or 'exhausted your capacity' in err):
+        _gemini_quota_probe_set(err)
+        return None, 'gemini-quota'
     if not verdict:
         return None, 'gemini-empty'
     return verdict, 'gemini-ok'
+
+
+def _parse_verdict_line(stdout: str) -> str | None:
+    # Strict-match the protocol: bare 'SAFE' (any case) or a 'SAFE:' / 'UNSAFE:'
+    # prefix (any case, colon required). Rejects 'SAFEGUARDS', preamble lines,
+    # and code-fence wrappers that startswith() alone would mis-match.
+    # Walks bottom-up so a model that prepends "Here's my assessment:" still
+    # resolves to the verdict on the last line.
+    for line in reversed((stdout or '').splitlines()):
+        s = line.strip()
+        if not s:
+            continue
+        u = s.upper()
+        if u == 'SAFE' or u.startswith('SAFE:') or u.startswith('UNSAFE:'):
+            return s
+    return None
 
 
 def _provider_codex(prompt: str, payload: str, timeout: int) -> tuple[str | None, str]:
@@ -389,12 +412,9 @@ def _provider_codex(prompt: str, payload: str, timeout: int) -> tuple[str | None
         return None, 'codex-missing'
     except subprocess.TimeoutExpired:
         return None, 'codex-timeout'
-    # codex emits hook/session header lines + "codex" prefix line + verdict.
-    # Walk lines bottom-up; first line that starts SAFE/UNSAFE is the answer.
-    for line in reversed((proc.stdout or '').splitlines()):
-        s = line.strip()
-        if s.upper().startswith(('SAFE', 'UNSAFE')):
-            return s, 'codex-ok'
+    v = _parse_verdict_line(proc.stdout or '')
+    if v:
+        return v, 'codex-ok'
     return None, 'codex-empty'
 
 
@@ -414,12 +434,9 @@ def _provider_claude(prompt: str, payload: str, timeout: int) -> tuple[str | Non
         return None, 'claude-missing'
     except subprocess.TimeoutExpired:
         return None, 'claude-timeout'
-    out = (proc.stdout or '').strip()
-    if not out:
-        return None, 'claude-empty'
-    first = out.splitlines()[0].strip()
-    if first.upper().startswith(('SAFE', 'UNSAFE')):
-        return first, 'claude-ok'
+    v = _parse_verdict_line(proc.stdout or '')
+    if v:
+        return v, 'claude-ok'
     return None, 'claude-empty'
 
 
