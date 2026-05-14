@@ -1410,20 +1410,22 @@ def _wiki_section_exists(wiki_text: str, header: str) -> bool:
 def _recover_wiki_body(body: str) -> tuple[str, str | None]:
     """Recover from common caller mistakes that produce literal `\\n` in markdown.
 
+    Byte-equivalent to the server-side `_recover_wiki_body` in tark-platform
+    `backend/project_management/api/views/crud.py`. Reason tags MUST match
+    between the two so audit_event (server) and stderr warning (CLI) refer
+    to the same recovery class.
+
     Two corruptions are caught:
 
-    1. **JSON-quoted string** — the body starts and ends with `"` and every
-       newline is `\\n`. The caller passed `json.dumps(markdown)` instead of
-       the markdown itself. `json.loads` returns the unescaped string.
-    2. **Naked escape** — the caller stripped the outer quotes after
-       `json.dumps`, leaving literal `\\n` in a one-liner.
+    1. **JSON-quoted string** (tag: `json_quoted`) — body starts/ends with `"`
+       and every newline is `\\n`. `json.loads` returns the unescaped string.
+    2. **Naked escape** (tag: `naked_escape:max_line=N,literal_n=M`) — caller
+       stripped outer quotes after `json.dumps`. Guard: longest line > 500
+       chars AND >= 5 literal `\\n`. A doc that legitimately discusses `\\n`
+       keeps short lines, so it's a no-op.
 
-    Guard against false positives: the naked-escape branch only fires when the
-    longest line is > 500 chars AND there are >= 5 literal `\\n` sequences.
-    A doc that legitimately discusses `\\n` keeps short lines, so it's a no-op.
-
-    Returns a (recovered_body, notice_or_none) tuple; the notice is a one-line
-    string the caller may print to stderr.
+    Returns `(recovered_body, reason)`. `reason` is None when no recovery
+    fired. Use `_format_recovery_notice(reason)` to render for stderr.
     """
     if not isinstance(body, str) or not body:
         return body, None
@@ -1433,7 +1435,7 @@ def _recover_wiki_body(body: str) -> tuple[str, str | None]:
         try:
             decoded = json.loads(stripped)
             if isinstance(decoded, str) and decoded != stripped:
-                return decoded, 'wiki body was JSON-quoted; unwrapped before send'
+                return decoded, 'json_quoted'
         except (ValueError, TypeError):
             pass
 
@@ -1448,9 +1450,27 @@ def _recover_wiki_body(body: str) -> tuple[str, str | None]:
             .replace('\\t', '\t')
             .replace('\\"', '"')
         )
-        return recovered, f'wiki body had literal \\n in a {max_line}-char line; un-escaped before send'
+        return recovered, f'naked_escape:max_line={max_line},literal_n={literal_n}'
 
     return body, None
+
+
+def _format_recovery_notice(reason: str) -> str:
+    """Render a recovery reason tag as a human-readable stderr line.
+
+    The tag itself is the stable contract (same as server audit_event). This
+    function is the I/O-side presentation only — if a new tag is added in
+    `_recover_wiki_body`, add a branch here too. Falls back to the raw tag.
+    """
+    if reason == 'json_quoted':
+        return 'wiki body was JSON-quoted; unwrapped before send'
+    if reason.startswith('naked_escape:'):
+        params = dict(p.split('=') for p in reason.split(':', 1)[1].split(','))
+        return (
+            f'wiki body had {params.get("literal_n", "?")} literal \\n in a '
+            f'{params.get("max_line", "?")}-char line; un-escaped before send'
+        )
+    return f'wiki body recovered: {reason}'
 
 
 def _resolve_body(args) -> str | None:
@@ -1477,9 +1497,9 @@ def _resolve_body(args) -> str | None:
         else:
             return None
 
-    recovered, notice = _recover_wiki_body(raw)
-    if notice:
-        print(f'  warning: {notice}', file=sys.stderr)
+    recovered, reason = _recover_wiki_body(raw)
+    if reason:
+        print(f'  warning: {_format_recovery_notice(reason)} [tag={reason}]', file=sys.stderr)
     return recovered
 
 

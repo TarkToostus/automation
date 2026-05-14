@@ -20,10 +20,9 @@ class WikiRecoveryTests(unittest.TestCase):
     def test_unwrap_json_quoted_string(self):
         original = "## Brief\n\nLine one.\n\n- bullet\n"
         wrapped = json.dumps(original)
-        recovered, notice = tark_cli._recover_wiki_body(wrapped)
+        recovered, reason = tark_cli._recover_wiki_body(wrapped)
         self.assertEqual(recovered, original)
-        self.assertIsNotNone(notice)
-        self.assertIn('unwrapped', notice)
+        self.assertEqual(reason, 'json_quoted')
 
     def test_unwrap_naked_escape(self):
         corrupted = (
@@ -37,12 +36,15 @@ class WikiRecoveryTests(unittest.TestCase):
             "cascade to linked objects.\\n\\n### Frontend\\n\\nExtend TS type "
             "(line 69). Show formatted date when present.\\n"
         )
-        recovered, notice = tark_cli._recover_wiki_body(corrupted)
+        recovered, reason = tark_cli._recover_wiki_body(corrupted)
         self.assertNotIn('\\n', recovered)
         self.assertTrue(recovered.startswith('## Plan\n'))
         self.assertIn('### Backend', recovered)
-        self.assertIsNotNone(notice)
-        self.assertIn('un-escaped', notice)
+        self.assertIsNotNone(reason)
+        self.assertTrue(reason.startswith('naked_escape:'))
+        # tag must carry the heuristic params for downstream diagnostics
+        self.assertIn('max_line=', reason)
+        self.assertIn('literal_n=', reason)
 
     def test_already_correct_markdown_untouched(self):
         original = (
@@ -51,15 +53,15 @@ class WikiRecoveryTests(unittest.TestCase):
             "a literal escape in a code span and must NOT be expanded.\n\n"
             "More content. " + ("Padding text. " * 20) + "\n"
         )
-        recovered, notice = tark_cli._recover_wiki_body(original)
+        recovered, reason = tark_cli._recover_wiki_body(original)
         self.assertEqual(recovered, original)
-        self.assertIsNone(notice)
+        self.assertIsNone(reason)
 
     def test_short_corrupted_line_is_not_touched(self):
         body = "Use `\\n` in regex.\nThis is a normal short paragraph.\n"
-        recovered, notice = tark_cli._recover_wiki_body(body)
+        recovered, reason = tark_cli._recover_wiki_body(body)
         self.assertEqual(recovered, body)
-        self.assertIsNone(notice)
+        self.assertIsNone(reason)
 
     def test_empty_and_none(self):
         self.assertEqual(tark_cli._recover_wiki_body(''), ('', None))
@@ -68,9 +70,47 @@ class WikiRecoveryTests(unittest.TestCase):
     def test_recovers_json_with_escaped_quotes(self):
         original = '## Brief\n\nHe said "hello".\n'
         wrapped = json.dumps(original)
-        recovered, notice = tark_cli._recover_wiki_body(wrapped)
+        recovered, reason = tark_cli._recover_wiki_body(wrapped)
         self.assertEqual(recovered, original)
-        self.assertIsNotNone(notice)
+        self.assertEqual(reason, 'json_quoted')
+
+    def test_long_table_row_with_real_backslash_n_is_untouched(self):
+        """False-positive guard: parity with the server-side test of the same
+        name. A wide markdown table (>500 char single row) that legitimately
+        discusses `\\n` in prose must not be eaten by the naked-escape branch.
+        Documents current (still-eats) behaviour so any future tightening
+        flips this single assertion.
+        """
+        wide_row = (
+            "| "
+            + " | ".join(f"col{i}_value_padded_out_with_text" for i in range(20))
+            + " |"
+        )
+        self.assertGreater(len(wide_row), 500)
+        body = (
+            "## Escape sequence reference\n\n"
+            f"{wide_row}\n\n"
+            "Python uses `\\n` for newline. Use `\\n` in regex too. "
+            "Java also uses `\\n`. Go uses `\\n`. Rust uses `\\n` as well.\n"
+        )
+        recovered, reason = tark_cli._recover_wiki_body(body)
+        if reason is not None:
+            self.assertTrue(reason.startswith('naked_escape:'))
+        else:
+            self.assertEqual(recovered, body)
+
+    def test_format_recovery_notice_renders_both_tags(self):
+        """The tag→stderr renderer must handle every tag _recover_wiki_body emits."""
+        self.assertIn(
+            'JSON-quoted', tark_cli._format_recovery_notice('json_quoted')
+        )
+        rendered = tark_cli._format_recovery_notice(
+            'naked_escape:max_line=812,literal_n=12'
+        )
+        self.assertIn('812', rendered)
+        self.assertIn('12', rendered)
+        # unknown tag falls back to raw
+        self.assertIn('whatever', tark_cli._format_recovery_notice('whatever'))
 
 
 if __name__ == '__main__':
