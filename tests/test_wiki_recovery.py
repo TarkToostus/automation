@@ -4,19 +4,29 @@ Mirror of the server-side recovery in tark-platform's `_recover_wiki_body`.
 The CLI catches the same JSON-double-encode and naked-escape mistakes locally
 so the caller sees a warning before the request leaves their machine.
 """
+import io
 import json
+import os
 import sys
+import tempfile
 import unittest
+from argparse import Namespace
 from pathlib import Path
+from unittest import mock
 
-_AUTOMATION_DIR = str(Path(__file__).resolve().parent.parent)
-if _AUTOMATION_DIR not in sys.path:
-    sys.path.insert(0, _AUTOMATION_DIR)
+_AUTOMATION_DIR = Path(__file__).resolve().parent.parent
+if str(_AUTOMATION_DIR) not in sys.path:
+    sys.path.insert(0, str(_AUTOMATION_DIR))
 
 import tark_cli
 
 
-_SHARED_FIXTURE = Path('/Users/martin/_tark/shared/wiki_recovery_cases.json')
+_SHARED_FIXTURE = Path(
+    os.environ.get(
+        'WIKI_RECOVERY_FIXTURE',
+        str(_AUTOMATION_DIR.parent / 'shared' / 'wiki_recovery_cases.json'),
+    )
+)
 
 
 class WikiRecoveryTests(unittest.TestCase):
@@ -25,7 +35,7 @@ class WikiRecoveryTests(unittest.TestCase):
         wrapped = json.dumps(original)
         recovered, reason, params = tark_cli._recover_wiki_body(wrapped)
         self.assertEqual(recovered, original)
-        self.assertEqual(reason, 'json_quoted')
+        self.assertEqual(reason, tark_cli._REASON_JSON_QUOTED)
         self.assertEqual(params, {})
 
     def test_unwrap_naked_escape(self):
@@ -44,7 +54,7 @@ class WikiRecoveryTests(unittest.TestCase):
         self.assertNotIn('\\n', recovered)
         self.assertTrue(recovered.startswith('## Plan\n'))
         self.assertIn('### Backend', recovered)
-        self.assertEqual(reason, 'naked_escape')
+        self.assertEqual(reason, tark_cli._REASON_NAKED_ESCAPE)
         self.assertGreater(params['max_line'], 500)
         self.assertGreaterEqual(params['literal_n'], 5)
 
@@ -76,7 +86,7 @@ class WikiRecoveryTests(unittest.TestCase):
         wrapped = json.dumps(original)
         recovered, reason, params = tark_cli._recover_wiki_body(wrapped)
         self.assertEqual(recovered, original)
-        self.assertEqual(reason, 'json_quoted')
+        self.assertEqual(reason, tark_cli._REASON_JSON_QUOTED)
         self.assertEqual(params, {})
 
     def test_long_table_row_with_real_backslash_n_is_untouched(self):
@@ -98,7 +108,7 @@ class WikiRecoveryTests(unittest.TestCase):
         )
         recovered, reason, params = tark_cli._recover_wiki_body(body)
         if reason is not None:
-            self.assertEqual(reason, 'naked_escape')
+            self.assertEqual(reason, tark_cli._REASON_NAKED_ESCAPE)
             self.assertGreater(params['max_line'], 500)
         else:
             self.assertEqual(recovered, body)
@@ -106,10 +116,10 @@ class WikiRecoveryTests(unittest.TestCase):
     def test_format_recovery_notice_renders_both_reasons(self):
         self.assertIn(
             'JSON-quoted',
-            tark_cli._format_recovery_notice('json_quoted', {}),
+            tark_cli._format_recovery_notice(tark_cli._REASON_JSON_QUOTED, {}),
         )
         rendered = tark_cli._format_recovery_notice(
-            'naked_escape', {'max_line': 812, 'literal_n': 12}
+            tark_cli._REASON_NAKED_ESCAPE, {'max_line': 812, 'literal_n': 12}
         )
         self.assertIn('812', rendered)
         self.assertIn('12', rendered)
@@ -134,6 +144,72 @@ class WikiRecoveryTests(unittest.TestCase):
                 self.assertEqual(body, case['expected_body'], 'body mismatch')
                 self.assertEqual(reason, case['expected_reason'], 'reason mismatch')
                 self.assertEqual(params, case['expected_params'], 'params mismatch')
+
+
+class WikiResolveBodyTests(unittest.TestCase):
+    """Cover the body-source precedence wrapper. Recovery is tested above;
+    this suite is about argument handling + I/O."""
+
+    def _ns(self, **kw):
+        defaults = {'body': None, 'from_file': None, 'from_stdin': False}
+        defaults.update(kw)
+        return Namespace(**defaults)
+
+    def test_returns_none_when_no_source_given(self):
+        self.assertIsNone(tark_cli._resolve_body(self._ns()))
+
+    def test_body_arg_takes_precedence_over_file(self):
+        with tempfile.NamedTemporaryFile('w', suffix='.md', delete=False) as fh:
+            fh.write('## From file\n')
+            path = fh.name
+        try:
+            ns = self._ns(body='## From arg\n', from_file=path)
+            self.assertEqual(tark_cli._resolve_body(ns), '## From arg\n')
+        finally:
+            os.unlink(path)
+
+    def test_body_arg_takes_precedence_over_stdin(self):
+        ns = self._ns(body='## From arg\n', from_stdin=True)
+        with mock.patch.object(sys, 'stdin', io.StringIO('## From stdin\n')):
+            self.assertEqual(tark_cli._resolve_body(ns), '## From arg\n')
+
+    def test_from_file_reads_utf8(self):
+        with tempfile.NamedTemporaryFile('w', suffix='.md', delete=False, encoding='utf-8') as fh:
+            fh.write('## Plaan\n\nKõik kombes.\n')
+            path = fh.name
+        try:
+            self.assertEqual(
+                tark_cli._resolve_body(self._ns(from_file=path)),
+                '## Plaan\n\nKõik kombes.\n',
+            )
+        finally:
+            os.unlink(path)
+
+    def test_from_file_missing_returns_none_and_exits(self):
+        ns = self._ns(from_file='/nonexistent/path/to/wiki.md')
+        with self.assertRaises(SystemExit):
+            tark_cli._resolve_body(ns)
+
+    def test_from_stdin_reads(self):
+        ns = self._ns(from_stdin=True)
+        with mock.patch.object(sys, 'stdin', io.StringIO('## From stdin\n')):
+            self.assertEqual(tark_cli._resolve_body(ns), '## From stdin\n')
+
+    def test_recovery_warning_fires_for_json_quoted(self):
+        wrapped = json.dumps('## Brief\n\nBody.\n')
+        ns = self._ns(body=wrapped)
+        with mock.patch.object(sys, 'stderr', io.StringIO()) as err:
+            result = tark_cli._resolve_body(ns)
+        self.assertEqual(result, '## Brief\n\nBody.\n')
+        stderr = err.getvalue()
+        self.assertIn('JSON-quoted', stderr)
+        self.assertIn(f'reason={tark_cli._REASON_JSON_QUOTED}', stderr)
+
+    def test_no_warning_on_clean_body(self):
+        ns = self._ns(body='## Brief\n\nBody.\n')
+        with mock.patch.object(sys, 'stderr', io.StringIO()) as err:
+            tark_cli._resolve_body(ns)
+        self.assertEqual(err.getvalue(), '')
 
 
 if __name__ == '__main__':
