@@ -48,6 +48,9 @@ Usage (binary installed as `tark_cli` at ~/bin/tark_cli; examples below use that
     tark_cli wiki <task-id> set     --section <h> --body <md>  # Upsert (preferred)
     tark_cli wiki <task-id> append  --section <h> --body <md>  # Append (refuses if dup)
     tark_cli wiki <task-id> replace --section <h> --body <md>  # Replace (404 if missing)
+    tark_cli wiki <task-id> put     --body <md>                # Replace whole wiki (PUT)
+    tark_cli wiki <task-id> put     --from-file path/to.md     # Same, body read from file
+    tark_cli wiki <task-id> put     --from-stdin               # Same, body read from stdin
     tark_cli stage <task-id> <stage>        # Advance task stage (gates on wiki)
     tark_cli update <task-id> [--priority X] [--column Y] [--assignee Z] [--name ...]  # Patch task fields
     tark_cli tokens                         # List PATs
@@ -205,6 +208,10 @@ def _get(path: str, **params) -> dict | list:
 
 def _post(path: str, body: dict | None = None) -> dict | list:
     return _request('POST', path, body=body)
+
+
+def _put(path: str, body: dict | None = None) -> dict | list:
+    return _request('PUT', path, body=body)
 
 
 # ---------------------------------------------------------------------------
@@ -558,6 +565,10 @@ def _table(headers: list[str], rows: list[list], widths: list[int] | None = None
 
 
 def _ago(iso_str: str | None) -> str:
+    """Legacy relative-time. Strips tz before comparing to utcnow — drifts by
+    local-tz offset. Kept for the 4 existing callers (last_seen / last_used /
+    started timer) where the drift hasn't bitten anyone yet. New code: use
+    _ago_aware which round-trips timezones correctly via fromisoformat."""
     if not iso_str:
         return 'never'
     try:
@@ -584,6 +595,29 @@ def _ago(iso_str: str | None) -> str:
         secs = diff.total_seconds()
         if secs < 60:
             return 'just now'
+        if secs < 3600:
+            return f'{int(secs // 60)}m ago'
+        if secs < 86400:
+            return f'{secs / 3600:.1f}h ago'
+        return f'{int(secs // 86400)}d ago'
+    except Exception:
+        return iso_str[:16] if iso_str else 'unknown'
+
+
+def _ago_aware(iso_str: str | None) -> str:
+    """tz-aware relative time. Use this for fresh code (e.g. sidecar tracking
+    where seconds matter and the daemon emits +HH:MM offsets)."""
+    if not iso_str:
+        return 'never'
+    try:
+        from datetime import timezone
+        dt = datetime.fromisoformat(iso_str.replace('Z', '+00:00'))
+        now = datetime.now(dt.tzinfo) if dt.tzinfo else datetime.now(timezone.utc)
+        secs = (now - dt).total_seconds()
+        if secs < 0:
+            return 'in future'
+        if secs < 60:
+            return f'{int(secs)}s ago'
         if secs < 3600:
             return f'{int(secs // 60)}m ago'
         if secs < 86400:
@@ -743,6 +777,30 @@ def cmd_task(args):
     print(f'\n  #{data.get("id")} {data.get("name")}')
     print(f'  Project: {data.get("project_name")}  Column: {data.get("column_name") or "-"}')
     print(f'  Priority: {data.get("priority")}  Assignee: {data.get("assignee_name") or "-"}')
+
+    # Sidecar/PM tracking fields. Always show stage + updated_at — they're the
+    # cheapest "is something happening?" signal. Claim block prints only when
+    # an engine is actively holding the task.
+    stage = data.get('stage')
+    updated = data.get('updated_at')
+    if stage or updated:
+        parts = []
+        if stage:
+            parts.append(f'Stage: {stage}')
+        if updated:
+            parts.append(f'Updated: {_ago_aware(updated)}')
+        print('  ' + '  '.join(parts))
+
+    claim_token = data.get('claim_token')
+    if claim_token:
+        holder = data.get('claim_holder') or 'unknown'
+        expires = data.get('claim_expires_at')
+        token_short = claim_token[:8] if isinstance(claim_token, str) else str(claim_token)
+        if expires:
+            print(f'  Claim: {holder} (token {token_short}, expires {_ago_aware(expires)})')
+        else:
+            print(f'  Claim: {holder} (token {token_short})')
+
     if data.get('total_hours'):
         print(f'  Hours: {data.get("total_hours")}')
     if data.get('description'):
@@ -1349,16 +1407,133 @@ def _wiki_section_exists(wiki_text: str, header: str) -> bool:
     return False
 
 
+# Cross-repo contract: these reason tags appear in shared fixture
+# (_tark/shared/wiki_recovery_cases.json) and the server-side mirror in
+# tark-platform `_recover_wiki_body`. Rename = drift = test failure.
+_REASON_JSON_QUOTED = 'json_quoted'
+_REASON_NAKED_ESCAPE = 'naked_escape'
+
+# Naked-escape heuristic thresholds. Tuning these requires updating the server
+# mirror AND the fixture's expected_params for any case near the boundary.
+_NAKED_ESCAPE_MIN_LINE = 500
+_NAKED_ESCAPE_MIN_LITERAL_N = 5
+
+
+def _recover_wiki_body(body: str) -> tuple[str, str | None, dict[str, int]]:
+    """Recover from common caller mistakes that produce literal `\\n` in markdown.
+
+    Contract-equivalent to the server-side `_recover_wiki_body` in tark-platform
+    `backend/project_management/api/views/crud.py`. Both implementations are
+    pinned by the shared fixture at `_tark/shared/wiki_recovery_cases.json`.
+
+    Two corruptions are caught:
+
+    1. **JSON-quoted string** (reason=`json_quoted`) — body starts/ends with
+       `"` and every newline is `\\n`. `json.loads` returns the unescaped
+       string.
+    2. **Naked escape** (reason=`naked_escape`) — caller stripped outer quotes
+       after `json.dumps`. Guard: longest line > _NAKED_ESCAPE_MIN_LINE AND
+       >= _NAKED_ESCAPE_MIN_LITERAL_N literal `\\n`. Docs that discuss `\\n`
+       legitimately keep short lines.
+
+    Returns `(recovered_body, reason, params)`. `reason` is None and `params`
+    is empty when no recovery fired. `params` carries heuristic values
+    (`max_line`, `literal_n`) so callers log them as structured fields rather
+    than embedding in the reason string.
+    """
+    if not isinstance(body, str) or not body:
+        return body, None, {}
+
+    stripped = body.strip()
+    if len(stripped) > 2 and stripped[0] == '"' and stripped[-1] == '"':
+        try:
+            decoded = json.loads(stripped)
+            if isinstance(decoded, str) and decoded != stripped:
+                return decoded, _REASON_JSON_QUOTED, {}
+        except (ValueError, TypeError):
+            pass
+
+    lines = body.split('\n')
+    max_line = max((len(line) for line in lines), default=0)
+    literal_n = body.count('\\n')
+    if max_line > _NAKED_ESCAPE_MIN_LINE and literal_n >= _NAKED_ESCAPE_MIN_LITERAL_N:
+        recovered = (
+            body
+            .replace('\\r\\n', '\n')
+            .replace('\\n', '\n')
+            .replace('\\t', '\t')
+            .replace('\\"', '"')
+        )
+        return recovered, _REASON_NAKED_ESCAPE, {'max_line': max_line, 'literal_n': literal_n}
+
+    return body, None, {}
+
+
+def _format_recovery_notice(reason: str, params: dict[str, int]) -> str:
+    """Render a recovery reason tag as a human-readable stderr line.
+
+    The reason+params pair is the stable contract (same as server audit_event
+    structured fields). This function is the I/O-side presentation only —
+    if a new reason is added in `_recover_wiki_body`, add a branch here too.
+    Falls back to the raw reason.
+    """
+    if reason == _REASON_JSON_QUOTED:
+        return 'wiki body was JSON-quoted; unwrapped before send'
+    if reason == _REASON_NAKED_ESCAPE:
+        return (
+            f'wiki body had {params.get("literal_n", "?")} literal \\n in a '
+            f'{params.get("max_line", "?")}-char line; un-escaped before send'
+        )
+    return f'wiki body recovered: {reason}'
+
+
+def _resolve_body(args) -> str | None:
+    """Body source precedence: --body > --from-file > --from-stdin. Returns None if none given.
+
+    Bodies are passed through `_recover_wiki_body` so JSON-double-encoded
+    markdown (a common caller mistake) is auto-recovered before send. The
+    server applies the same recovery as a backstop.
+    """
+    raw: str | None
+    if getattr(args, 'body', None) is not None:
+        raw = args.body
+    else:
+        src = getattr(args, 'from_file', None)
+        if src:
+            try:
+                with open(src, 'r', encoding='utf-8') as fh:
+                    raw = fh.read()
+            except OSError as e:
+                _err(f'--from-file: cannot read {src}: {e}')
+                return None
+        elif getattr(args, 'from_stdin', False):
+            raw = sys.stdin.read()
+        else:
+            return None
+
+    recovered, reason, params = _recover_wiki_body(raw)
+    if reason:
+        notice = _format_recovery_notice(reason, params)
+        param_str = ' '.join(f'{k}={v}' for k, v in params.items())
+        suffix = f' [reason={reason}{(" " + param_str) if param_str else ""}]'
+        print(f'  warning: {notice}{suffix}', file=sys.stderr)
+    return recovered
+
+
 def cmd_wiki(args):
-    """Fetch / set / append / replace task wiki sections.
+    """Fetch / set / append / replace / put task wiki.
 
     Actions:
         get      — fetch the markdown body (default)
         set      — upsert: replace if section exists, else append (preferred for /brief)
         append   — add a new `## Section` block; refuses if header already exists (use --force to override)
         replace  — overwrite an existing section's body; 404 if header missing
+        put      — replace the WHOLE wiki body (no section). Use --body, --from-file, or --from-stdin.
 
-    NOTE: POST payload uses field name `body` (not `content`).
+    Body source for any write op: --body <md> > --from-file <path> > --from-stdin.
+
+    NOTE: section ops (set/append/replace) use POST with payload field `body`.
+    Whole-body put uses PUT with payload field `wiki`.
     """
     path = f'/api/v1/pat/pm/tasks/{args.task_id}/wiki/'
 
@@ -1377,12 +1552,27 @@ def cmd_wiki(args):
         print(wiki_body)
         return
 
-    if args.action not in ('set', 'append', 'replace'):
-        _err(f'Unknown wiki action "{args.action}". Use: get, set, append, replace')
+    if args.action not in ('set', 'append', 'replace', 'put'):
+        _err(f'Unknown wiki action "{args.action}". Use: get, set, append, replace, put')
         return
 
-    if not args.section or args.body is None:
-        _err('--section and --body are required for set/append/replace')
+    body_text = _resolve_body(args)
+
+    if args.action == 'put':
+        if body_text is None:
+            _err('put: provide one of --body, --from-file <path>, --from-stdin')
+            return
+        data = _put(path, {'wiki': body_text})
+        if args.json:
+            _json_out(data)
+            return
+        wiki_out = data.get('wiki', '') if isinstance(data, dict) else ''
+        print(f'  wiki put OK on task #{args.task_id} ({len(wiki_out)} chars)')
+        return
+
+    # Section ops below — require --section and a body source.
+    if not args.section or body_text is None:
+        _err('--section and one of --body/--from-file/--from-stdin are required for set/append/replace')
         return
 
     op = args.action
@@ -1401,7 +1591,7 @@ def cmd_wiki(args):
                 f'Use `wiki set` to upsert, `wiki replace` to overwrite, or pass --force to add a duplicate.'
             )
 
-    payload = {'action': op, 'section': args.section, 'body': args.body}
+    payload = {'action': op, 'section': args.section, 'body': body_text}
     data = _post(path, payload)
     if args.json:
         _json_out(data)
@@ -1781,12 +1971,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--tasks', help='Tasks as JSON array string')
     p.add_argument('--tasks-file', help='Path to JSON file containing the tasks array')
 
-    # wiki <task-id> [get|set|append|replace] [--section H] [--body MD] [--force]
-    p = sub.add_parser('wiki', help='Task wiki get/set/append/replace (POST uses `body` field, not `content`)')
+    # wiki <task-id> [get|set|append|replace|put] [--section H] [--body MD|--from-file P|--from-stdin] [--force]
+    p = sub.add_parser('wiki', help='Task wiki get/set/append/replace/put (sections via POST `body`; whole body via PUT `wiki`)')
     p.add_argument('task_id', type=int, help='Task ID')
-    p.add_argument('action', nargs='?', choices=['get', 'set', 'append', 'replace'], help='Default: get. `set` upserts.')
-    p.add_argument('--section', help='Section header (without leading "## ")')
-    p.add_argument('--body', help='Section markdown body')
+    p.add_argument('action', nargs='?', choices=['get', 'set', 'append', 'replace', 'put'], help='Default: get. `set` upserts a section; `put` replaces the whole wiki.')
+    p.add_argument('--section', help='Section header (without leading "## "). Required for set/append/replace; ignored for put.')
+    p.add_argument('--body', help='Markdown body (literal). Use --from-file or --from-stdin for large content.')
+    p.add_argument('--from-file', dest='from_file', help='Read body from a file path')
+    p.add_argument('--from-stdin', dest='from_stdin', action='store_true', help='Read body from stdin (useful for piping)')
     p.add_argument('--force', action='store_true', help='Allow `append` to create a duplicate of an existing section')
 
     # stage <task-id> <stage>
