@@ -1407,20 +1407,80 @@ def _wiki_section_exists(wiki_text: str, header: str) -> bool:
     return False
 
 
-def _resolve_body(args) -> str | None:
-    """Body source precedence: --body > --from-file > --from-stdin. Returns None if none given."""
-    if getattr(args, 'body', None) is not None:
-        return args.body
-    src = getattr(args, 'from_file', None)
-    if src:
+def _recover_wiki_body(body: str) -> tuple[str, str | None]:
+    """Recover from common caller mistakes that produce literal `\\n` in markdown.
+
+    Two corruptions are caught:
+
+    1. **JSON-quoted string** — the body starts and ends with `"` and every
+       newline is `\\n`. The caller passed `json.dumps(markdown)` instead of
+       the markdown itself. `json.loads` returns the unescaped string.
+    2. **Naked escape** — the caller stripped the outer quotes after
+       `json.dumps`, leaving literal `\\n` in a one-liner.
+
+    Guard against false positives: the naked-escape branch only fires when the
+    longest line is > 500 chars AND there are >= 5 literal `\\n` sequences.
+    A doc that legitimately discusses `\\n` keeps short lines, so it's a no-op.
+
+    Returns a (recovered_body, notice_or_none) tuple; the notice is a one-line
+    string the caller may print to stderr.
+    """
+    if not isinstance(body, str) or not body:
+        return body, None
+
+    stripped = body.strip()
+    if len(stripped) > 2 and stripped[0] == '"' and stripped[-1] == '"':
         try:
-            with open(src, 'r', encoding='utf-8') as fh:
-                return fh.read()
-        except OSError as e:
-            _err(f'--from-file: cannot read {src}: {e}')
-    if getattr(args, 'from_stdin', False):
-        return sys.stdin.read()
-    return None
+            decoded = json.loads(stripped)
+            if isinstance(decoded, str) and decoded != stripped:
+                return decoded, 'wiki body was JSON-quoted; unwrapped before send'
+        except (ValueError, TypeError):
+            pass
+
+    lines = body.split('\n')
+    max_line = max((len(line) for line in lines), default=0)
+    literal_n = body.count('\\n')
+    if max_line > 500 and literal_n >= 5:
+        recovered = (
+            body
+            .replace('\\r\\n', '\n')
+            .replace('\\n', '\n')
+            .replace('\\t', '\t')
+            .replace('\\"', '"')
+        )
+        return recovered, f'wiki body had literal \\n in a {max_line}-char line; un-escaped before send'
+
+    return body, None
+
+
+def _resolve_body(args) -> str | None:
+    """Body source precedence: --body > --from-file > --from-stdin. Returns None if none given.
+
+    Bodies are passed through `_recover_wiki_body` so JSON-double-encoded
+    markdown (a common caller mistake) is auto-recovered before send. The
+    server applies the same recovery as a backstop.
+    """
+    raw: str | None
+    if getattr(args, 'body', None) is not None:
+        raw = args.body
+    else:
+        src = getattr(args, 'from_file', None)
+        if src:
+            try:
+                with open(src, 'r', encoding='utf-8') as fh:
+                    raw = fh.read()
+            except OSError as e:
+                _err(f'--from-file: cannot read {src}: {e}')
+                return None
+        elif getattr(args, 'from_stdin', False):
+            raw = sys.stdin.read()
+        else:
+            return None
+
+    recovered, notice = _recover_wiki_body(raw)
+    if notice:
+        print(f'  warning: {notice}', file=sys.stderr)
+    return recovered
 
 
 def cmd_wiki(args):
