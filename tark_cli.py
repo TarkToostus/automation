@@ -1407,6 +1407,18 @@ def _wiki_section_exists(wiki_text: str, header: str) -> bool:
     return False
 
 
+# Cross-repo contract: these reason tags appear in shared fixture
+# (_tark/shared/wiki_recovery_cases.json) and the server-side mirror in
+# tark-platform `_recover_wiki_body`. Rename = drift = test failure.
+_REASON_JSON_QUOTED = 'json_quoted'
+_REASON_NAKED_ESCAPE = 'naked_escape'
+
+# Naked-escape heuristic thresholds. Tuning these requires updating the server
+# mirror AND the fixture's expected_params for any case near the boundary.
+_NAKED_ESCAPE_MIN_LINE = 500
+_NAKED_ESCAPE_MIN_LITERAL_N = 5
+
+
 def _recover_wiki_body(body: str) -> tuple[str, str | None, dict[str, int]]:
     """Recover from common caller mistakes that produce literal `\\n` in markdown.
 
@@ -1420,8 +1432,9 @@ def _recover_wiki_body(body: str) -> tuple[str, str | None, dict[str, int]]:
        `"` and every newline is `\\n`. `json.loads` returns the unescaped
        string.
     2. **Naked escape** (reason=`naked_escape`) — caller stripped outer quotes
-       after `json.dumps`. Guard: longest line > 500 chars AND >= 5 literal
-       `\\n`. Docs that discuss `\\n` legitimately keep short lines.
+       after `json.dumps`. Guard: longest line > _NAKED_ESCAPE_MIN_LINE AND
+       >= _NAKED_ESCAPE_MIN_LITERAL_N literal `\\n`. Docs that discuss `\\n`
+       legitimately keep short lines.
 
     Returns `(recovered_body, reason, params)`. `reason` is None and `params`
     is empty when no recovery fired. `params` carries heuristic values
@@ -1436,14 +1449,14 @@ def _recover_wiki_body(body: str) -> tuple[str, str | None, dict[str, int]]:
         try:
             decoded = json.loads(stripped)
             if isinstance(decoded, str) and decoded != stripped:
-                return decoded, 'json_quoted', {}
+                return decoded, _REASON_JSON_QUOTED, {}
         except (ValueError, TypeError):
             pass
 
     lines = body.split('\n')
     max_line = max((len(line) for line in lines), default=0)
     literal_n = body.count('\\n')
-    if max_line > 500 and literal_n >= 5:
+    if max_line > _NAKED_ESCAPE_MIN_LINE and literal_n >= _NAKED_ESCAPE_MIN_LITERAL_N:
         recovered = (
             body
             .replace('\\r\\n', '\n')
@@ -1451,7 +1464,7 @@ def _recover_wiki_body(body: str) -> tuple[str, str | None, dict[str, int]]:
             .replace('\\t', '\t')
             .replace('\\"', '"')
         )
-        return recovered, 'naked_escape', {'max_line': max_line, 'literal_n': literal_n}
+        return recovered, _REASON_NAKED_ESCAPE, {'max_line': max_line, 'literal_n': literal_n}
 
     return body, None, {}
 
@@ -1464,9 +1477,9 @@ def _format_recovery_notice(reason: str, params: dict[str, int]) -> str:
     if a new reason is added in `_recover_wiki_body`, add a branch here too.
     Falls back to the raw reason.
     """
-    if reason == 'json_quoted':
+    if reason == _REASON_JSON_QUOTED:
         return 'wiki body was JSON-quoted; unwrapped before send'
-    if reason == 'naked_escape':
+    if reason == _REASON_NAKED_ESCAPE:
         return (
             f'wiki body had {params.get("literal_n", "?")} literal \\n in a '
             f'{params.get("max_line", "?")}-char line; un-escaped before send'
