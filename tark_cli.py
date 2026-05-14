@@ -1407,35 +1407,36 @@ def _wiki_section_exists(wiki_text: str, header: str) -> bool:
     return False
 
 
-def _recover_wiki_body(body: str) -> tuple[str, str | None]:
+def _recover_wiki_body(body: str) -> tuple[str, str | None, dict[str, int]]:
     """Recover from common caller mistakes that produce literal `\\n` in markdown.
 
-    Byte-equivalent to the server-side `_recover_wiki_body` in tark-platform
-    `backend/project_management/api/views/crud.py`. Reason tags MUST match
-    between the two so audit_event (server) and stderr warning (CLI) refer
-    to the same recovery class.
+    Contract-equivalent to the server-side `_recover_wiki_body` in tark-platform
+    `backend/project_management/api/views/crud.py`. Both implementations are
+    pinned by the shared fixture at `_tark/shared/wiki_recovery_cases.json`.
 
     Two corruptions are caught:
 
-    1. **JSON-quoted string** (tag: `json_quoted`) — body starts/ends with `"`
-       and every newline is `\\n`. `json.loads` returns the unescaped string.
-    2. **Naked escape** (tag: `naked_escape:max_line=N,literal_n=M`) — caller
-       stripped outer quotes after `json.dumps`. Guard: longest line > 500
-       chars AND >= 5 literal `\\n`. A doc that legitimately discusses `\\n`
-       keeps short lines, so it's a no-op.
+    1. **JSON-quoted string** (reason=`json_quoted`) — body starts/ends with
+       `"` and every newline is `\\n`. `json.loads` returns the unescaped
+       string.
+    2. **Naked escape** (reason=`naked_escape`) — caller stripped outer quotes
+       after `json.dumps`. Guard: longest line > 500 chars AND >= 5 literal
+       `\\n`. Docs that discuss `\\n` legitimately keep short lines.
 
-    Returns `(recovered_body, reason)`. `reason` is None when no recovery
-    fired. Use `_format_recovery_notice(reason)` to render for stderr.
+    Returns `(recovered_body, reason, params)`. `reason` is None and `params`
+    is empty when no recovery fired. `params` carries heuristic values
+    (`max_line`, `literal_n`) so callers log them as structured fields rather
+    than embedding in the reason string.
     """
     if not isinstance(body, str) or not body:
-        return body, None
+        return body, None, {}
 
     stripped = body.strip()
     if len(stripped) > 2 and stripped[0] == '"' and stripped[-1] == '"':
         try:
             decoded = json.loads(stripped)
             if isinstance(decoded, str) and decoded != stripped:
-                return decoded, 'json_quoted'
+                return decoded, 'json_quoted', {}
         except (ValueError, TypeError):
             pass
 
@@ -1450,22 +1451,22 @@ def _recover_wiki_body(body: str) -> tuple[str, str | None]:
             .replace('\\t', '\t')
             .replace('\\"', '"')
         )
-        return recovered, f'naked_escape:max_line={max_line},literal_n={literal_n}'
+        return recovered, 'naked_escape', {'max_line': max_line, 'literal_n': literal_n}
 
-    return body, None
+    return body, None, {}
 
 
-def _format_recovery_notice(reason: str) -> str:
+def _format_recovery_notice(reason: str, params: dict[str, int]) -> str:
     """Render a recovery reason tag as a human-readable stderr line.
 
-    The tag itself is the stable contract (same as server audit_event). This
-    function is the I/O-side presentation only — if a new tag is added in
-    `_recover_wiki_body`, add a branch here too. Falls back to the raw tag.
+    The reason+params pair is the stable contract (same as server audit_event
+    structured fields). This function is the I/O-side presentation only —
+    if a new reason is added in `_recover_wiki_body`, add a branch here too.
+    Falls back to the raw reason.
     """
     if reason == 'json_quoted':
         return 'wiki body was JSON-quoted; unwrapped before send'
-    if reason.startswith('naked_escape:'):
-        params = dict(p.split('=') for p in reason.split(':', 1)[1].split(','))
+    if reason == 'naked_escape':
         return (
             f'wiki body had {params.get("literal_n", "?")} literal \\n in a '
             f'{params.get("max_line", "?")}-char line; un-escaped before send'
@@ -1497,9 +1498,12 @@ def _resolve_body(args) -> str | None:
         else:
             return None
 
-    recovered, reason = _recover_wiki_body(raw)
+    recovered, reason, params = _recover_wiki_body(raw)
     if reason:
-        print(f'  warning: {_format_recovery_notice(reason)} [tag={reason}]', file=sys.stderr)
+        notice = _format_recovery_notice(reason, params)
+        param_str = ' '.join(f'{k}={v}' for k, v in params.items())
+        suffix = f' [reason={reason}{(" " + param_str) if param_str else ""}]'
+        print(f'  warning: {notice}{suffix}', file=sys.stderr)
     return recovered
 
 
