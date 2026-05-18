@@ -763,6 +763,15 @@ def cmd_task(args):
     """Task detail."""
     data = _get(f'/api/v1/pat/pm/tasks/{args.id}/')
 
+    # Single source of truth for the C2 web URL — downstream callers
+    # (orchestrator/daemon/cli_tools/aims.py, etc.) should NOT rebuild this
+    # from project_id + board + id. Keep the format here.
+    if isinstance(data, dict) and data.get('id') and data.get('project_id') and data.get('board'):
+        data['url'] = (
+            f"{_get_url().rstrip('/')}/project-management/plan/pm-projects/"
+            f"{data['project_id']}/board/{data['board']}/tasks/{data['id']}"
+        )
+
     _safety_check_or_die(
         'task',
         data.get('name', '') if isinstance(data, dict) else '',
