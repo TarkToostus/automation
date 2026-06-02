@@ -11,6 +11,7 @@ Run: cd /Users/martin/_tark/automation && python -m pytest tests/test_c2_auto.py
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -318,6 +319,157 @@ def test_promote_happy_path_from_idea(stub_cli, capsys, tmp_path):
     assert update_idx > last_stage_idx
 
 
+# ---------------------------------------------------------------------------
+# promote — daemon-readable Brief/Plan (the #4455 h2->sibling fix)
+# ---------------------------------------------------------------------------
+
+def daemon_extract_section(full: str, section: str) -> str:
+    """Replica of daemon/cli_tools/c2.py:_extract_section — the exact regex the
+    WorkEngine uses to read a wiki section body."""
+    m = re.compile(rf"^## {re.escape(section)}\s*\n(.*?)(?=^## |\Z)", re.M | re.S).search(full)
+    return m.group(1).strip() if m else ""
+
+
+def test_demote_inner_headings_unit():
+    src = (
+        "# Title\n"
+        "## Problem\nfoo\n"
+        "### Already h3\nbar\n"
+        "#### h4 stays\n"
+        "```bash\n## not-a-heading inside fence\n```\n"
+        "## Goals\nbaz\n"
+    )
+    out = c2_auto.demote_inner_headings(src)
+    lines = out.splitlines()
+    # every former '## ' heading demoted, no h2 heading left behind
+    assert "### Problem" in lines and "### Goals" in lines
+    assert "## Problem" not in lines and "## Goals" not in lines
+    # h1 / h3 / h4 untouched
+    assert "# Title" in lines
+    assert "### Already h3" in lines
+    assert "#### h4 stays" in lines
+    # '## ' inside the fence is preserved verbatim (the only surviving '## ' line)
+    assert "## not-a-heading inside fence" in lines
+    assert [ln for ln in lines if ln.startswith("## ")] == ["## not-a-heading inside fence"]
+    # trailing newline preserved
+    assert out.endswith("\n")
+
+
+def test_promote_writes_daemon_readable_brief_plan(stub_cli, capsys, tmp_path):
+    """The end-to-end invariant: after promote, the daemon's _extract_section
+    regex must read a NON-EMPTY Brief and Plan body. Pre-fix it read empty
+    because the brief's '## Problem' rendered as a sibling of '## Brief'."""
+    stub_cli.responses[(True, "task", "4280")] = (
+        0, json.dumps(make_task(column_name="IDEA", stage="brief")), "",
+    )
+    (tmp_path / "b.md").write_text(VALID_BRIEF)
+    (tmp_path / "p.md").write_text(VALID_PLAN)
+
+    rc = run_cmd(
+        "promote", "4280",
+        "--brief-file", str(tmp_path / "b.md"),
+        "--plan-file", str(tmp_path / "p.md"),
+    )
+    assert rc == 0, capsys.readouterr().err
+
+    # Pull the bodies that were written (call shape: ..., '--section', S, '--body', BODY)
+    writes = {
+        c[5]: c[7]
+        for c in stub_cli.calls
+        if len(c) >= 8 and c[1] == "wiki" and c[3] == "set" and c[6] == "--body"
+    }
+    brief_body, plan_body = writes["Brief"], writes["Plan"]
+
+    # No raw '## ' heading escaped into the body (would re-terminate the regex).
+    assert not any(ln.startswith("## ") for ln in brief_body.splitlines())
+    assert not any(ln.startswith("## ") for ln in plan_body.splitlines())
+    assert "### Problem" in brief_body and "### Architecture" in plan_body
+
+    # Simulate the wiki the way tark_cli renders the sections, then read it back
+    # with the daemon's exact regex — both bodies must be non-empty.
+    wiki = (
+        f"## Scope\nx\n\n## Brief\n\n{brief_body}\n\n"
+        f"## Plan\n\n{plan_body}\n\n## Review: Plan\n\nskipped\n"
+    )
+    brief_read = daemon_extract_section(wiki, "Brief")
+    plan_read = daemon_extract_section(wiki, "Plan")
+    # first AND last sub-section of each must survive (whole body captured)
+    assert "Problem" in brief_read and "Constraints" in brief_read
+    assert "Architecture" in plan_read and "Risks" in plan_read
+
+
+def test_promote_wiki_only_writes_sections_but_does_not_move(stub_cli, capsys, tmp_path):
+    """--wiki-only fills the wiki (the free part) but leaves the task on its
+    current column: no stage advance, no column move. The WORK move is the
+    human plan-confirm gate, run as a separate full promote."""
+    stub_cli.responses[(True, "task", "4280")] = (
+        0, json.dumps(make_task(column_name="IDEA", stage="brief")), "",
+    )
+    (tmp_path / "b.md").write_text(VALID_BRIEF)
+    (tmp_path / "p.md").write_text(VALID_PLAN)
+
+    rc = run_cmd(
+        "promote", "4280",
+        "--brief-file", str(tmp_path / "b.md"),
+        "--plan-file", str(tmp_path / "p.md"),
+        "--wiki-only",
+    )
+    assert rc == 0, capsys.readouterr().err
+
+    # All three wiki sections were written.
+    section_writes = [
+        c for c in stub_cli.calls
+        if len(c) >= 4 and c[1] == "wiki" and c[3] == "set"
+    ]
+    assert [c[5] for c in section_writes] == ["Brief", "Plan", "Review: Plan"]
+
+    # But NO stage advance and NO column move.
+    assert not any(c[1] == "stage" for c in stub_cli.calls)
+    assert not any(c[1] == "update" for c in stub_cli.calls)
+
+    out = capsys.readouterr().out
+    assert "NOT promoted" in out and "IDEA" in out
+
+
+def test_promote_wiki_only_still_validates_sections(stub_cli, capsys, tmp_path):
+    """--wiki-only is not a validation bypass — a stub brief is still refused,
+    and nothing is written."""
+    stub_cli.responses[(True, "task", "4280")] = (
+        0, json.dumps(make_task(column_name="IDEA")), "",
+    )
+    (tmp_path / "b.md").write_text("## Problem\nOnly this.\n")
+    (tmp_path / "p.md").write_text(VALID_PLAN)
+
+    rc = run_cmd(
+        "promote", "4280",
+        "--brief-file", str(tmp_path / "b.md"),
+        "--plan-file", str(tmp_path / "p.md"),
+        "--wiki-only",
+    )
+    assert rc == 1
+    assert "brief is missing required sections" in capsys.readouterr().err
+    assert not any(c[1] in ("wiki", "stage", "update") for c in stub_cli.calls)
+
+
+def test_promote_wiki_only_refuses_daemon_owned(stub_cli, capsys, tmp_path):
+    """--wiki-only respects the same column eligibility — never writes into a
+    daemon-owned task's wiki."""
+    stub_cli.responses[(True, "task", "4280")] = (
+        0, json.dumps(make_task(column_name="IN_PROGRESS")), "",
+    )
+    (tmp_path / "b.md").write_text(VALID_BRIEF)
+    (tmp_path / "p.md").write_text(VALID_PLAN)
+
+    rc = run_cmd(
+        "promote", "4280",
+        "--brief-file", str(tmp_path / "b.md"),
+        "--plan-file", str(tmp_path / "p.md"),
+        "--wiki-only",
+    )
+    assert rc == 3
+    assert not any(c[1] == "wiki" for c in stub_cli.calls)
+
+
 def test_promote_skips_stage_when_already_past_work(stub_cli, capsys, tmp_path):
     # If task somehow has stage past 'work' (would only happen if user is
     # repairing state), don't run backward stage calls.
@@ -368,9 +520,11 @@ def test_promote_aborts_on_wiki_write_failure(stub_cli, capsys, tmp_path):
     stub_cli.responses[(True, "task", "4280")] = (
         0, json.dumps(make_task(column_name="IDEA")), "",
     )
-    # Make the first wiki set fail.
+    # Make the first wiki set fail. promote demotes inner headings before writing,
+    # so the body sent to the CLI is the transformed brief, not raw VALID_BRIEF.
+    demoted_brief = c2_auto.demote_inner_headings(VALID_BRIEF)
     stub_cli.responses[
-        (False, "wiki", "4280", "set", "--section", "Brief", "--body", VALID_BRIEF)
+        (False, "wiki", "4280", "set", "--section", "Brief", "--body", demoted_brief)
     ] = (1, "", "wiki API timeout")
     brief_path = tmp_path / "b.md"
     brief_path.write_text(VALID_BRIEF)
