@@ -45,6 +45,7 @@ tark_cli tasks
 | `tark_cli time week` | Weekly time report grouped by project |
 | `tark_cli projects` / `boards` / `columns` | Browse PM structure |
 | `tark_cli leads` / `offers` / `contracts` | Browse CRM |
+| `tark_cli leads create --title "Acme retrofit" --company "Acme OÜ" --pipeline Imports --source COLD` | Create a lead (needs `sales:write` PAT) |
 | `tark_cli wiki 123` | Fetch task wiki markdown |
 | `tark_cli wiki 123 set --section Brief --body "..."` | Upsert a wiki section (preferred — dup-safe) |
 | `tark_cli wiki 123 append --section Brief --body "..."` | Append; refuses if section already exists |

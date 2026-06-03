@@ -35,6 +35,7 @@ Usage (binary installed as `tark_cli` at ~/bin/tark_cli; examples below use that
     tark_cli time [today|week|month]        # Time report
 
     tark_cli leads                          # Sales leads
+    tark_cli leads create --title "..." [--company X] [--pipeline Imports] [--source COLD]  # Create a lead
     tark_cli offers                         # Sales offers
     tark_cli offer-lines [--offer=X]        # Offer line items
     tark_cli contracts                      # Sales contracts
@@ -1004,8 +1005,68 @@ def cmd_time(args):
 # Commands: Leads
 # ---------------------------------------------------------------------------
 
+def _resolve_lead_pipeline(ref: str) -> int:
+    """Resolve a lead pipeline name (or substring) or numeric ID to its ID.
+
+    Filters to `pipeline_type == 'sales_lead'` so a same-named deal/order
+    pipeline is never picked. Mirrors the name-or-ID resolution in the
+    backend `lead_ingest` endpoint.
+    """
+    if str(ref).isdigit():
+        return int(ref)
+    data = _get('/api/v1/pat/sales/pipelines/')
+    results = data.get('results', data) if isinstance(data, dict) else data
+    leadp = [p for p in results if p.get('pipeline_type') == 'sales_lead']
+    exact = [p for p in leadp if p.get('name', '').lower() == ref.lower()]
+    match = exact or [p for p in leadp if ref.lower() in p.get('name', '').lower()]
+    if not match:
+        _err(f'No lead pipeline matching "{ref}". Run `tark_cli pipelines` to list.')
+    if len(match) > 1:
+        names = ', '.join(f'{p["name"]} (#{p["id"]})' for p in match[:5])
+        _err(f'Ambiguous lead pipeline "{ref}": {names}')
+    return match[0]['id']
+
+
+def _leads_create(args):
+    """Create a lead. POST /api/v1/pat/sales/leads/ — only `title` is required."""
+    title = ' '.join(args.title) if isinstance(args.title, list) else args.title
+    if not title:
+        _err('leads create requires --title')
+
+    body = {'title': title}
+    if getattr(args, 'company', None):
+        body['company_name'] = args.company
+    if getattr(args, 'person', None):
+        body['person_name'] = args.person
+    if getattr(args, 'email', None):
+        body['email'] = args.email
+    if getattr(args, 'phone', None):
+        body['phone'] = args.phone
+    if getattr(args, 'source', None):
+        body['source'] = args.source.upper()
+    if getattr(args, 'status', None):
+        body['status'] = args.status.upper()
+    if getattr(args, 'notes', None):
+        body['notes'] = args.notes
+    if getattr(args, 'pipeline', None):
+        body['pipeline'] = _resolve_lead_pipeline(args.pipeline)
+
+    data = _post('/api/v1/pat/sales/leads/', body)
+
+    if args.json:
+        _json_out(data)
+        return
+
+    company = data.get('company_name') or '-'
+    print(f'  Created lead #{data.get("id")}: {data.get("title")}  ({company})')
+
+
 def cmd_leads(args):
-    """Sales leads (CRM `/sales/leads/`). Supports filters."""
+    """Sales leads (CRM `/sales/leads/`). Browse with filters, or `create`."""
+    if getattr(args, 'action', None) == 'create':
+        _leads_create(args)
+        return
+
     params = {}
     if getattr(args, 'pipeline', None):
         params['pipeline__name'] = args.pipeline
@@ -1869,12 +1930,21 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser('time', help='Time report')
     p.add_argument('period', nargs='?', choices=['today', 'week', 'month'], default='week')
 
-    # leads
-    p = sub.add_parser('leads', help='Sales leads')
-    p.add_argument('--pipeline', help='Filter by pipeline name (e.g. Imports, Hiring)')
-    p.add_argument('--status', help='Filter by status (e.g. NEW)')
-    p.add_argument('--limit', type=int, help='Max results')
-    p.add_argument('--ordering', help='Ordering field (e.g. -created_at)')
+    # leads [list|create]
+    p = sub.add_parser('leads', help='Sales leads — browse, or `create`')
+    p.add_argument('action', nargs='?', choices=['list', 'create'], help='Default: list. `create` opens a new lead (needs sales:write PAT).')
+    p.add_argument('--pipeline', help='list: filter by pipeline name. create: target lead pipeline (name or ID, e.g. Imports)')
+    p.add_argument('--status', help='list: filter by status. create: initial status (NEW|CONTACTED|QUALIFIED|DISQUALIFIED)')
+    p.add_argument('--limit', type=int, help='list: max results')
+    p.add_argument('--ordering', help='list: ordering field (e.g. -created_at)')
+    # create-only fields (title required for create)
+    p.add_argument('--title', help='create: lead title (required for create)')
+    p.add_argument('--company', help='create: company name')
+    p.add_argument('--person', help='create: contact person name')
+    p.add_argument('--email', help='create: contact email')
+    p.add_argument('--phone', help='create: contact phone')
+    p.add_argument('--source', help='create: source (REFERRAL|GRANT|COLD|WEBSITE|EVENT|PARTNER, default COLD)')
+    p.add_argument('--notes', help='create: free-text notes')
 
     # offers
     p = sub.add_parser('offers', help='Sales offers')
