@@ -14,6 +14,7 @@ Examples are deliberately short and **read like recipes** — copy, adapt, run.
 | [`03_timer.sh`](03_timer.sh) | Start a timer, do work, stop it (saves a time entry automatically) |
 | [`04_batch_ingest.sh`](04_batch_ingest.sh) | Bulk-create tasks from a JSON file (idempotent — safe to re-run) |
 | [`05_weekly_report.sh`](05_weekly_report.sh) | Weekly time totals grouped by project (for invoicing) |
+| [`06_followup_draft.sh`](06_followup_draft.sh) | Enqueue due sales follow-ups, draft a DRAFT email, move it to REVIEW (gate-safe) |
 
 ## Running
 

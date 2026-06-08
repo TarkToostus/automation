@@ -1339,6 +1339,103 @@ def cmd_pipeline_stages(args):
 
 
 # ---------------------------------------------------------------------------
+# Commands: Sales follow-up engine (C2 #4600) — EmailTask cadence.
+# A due lead becomes a DRAFT EmailTask whose body IS the verbatim email.
+# followups-check enqueues DRAFTs; email-tasks lists them; email-task-set edits a
+# draft's body/subject/status. None can cross the SEND human-gate — the server
+# blocks a PAT from setting CONFIRMED/SENT/FAILED. Need a PAT with sales:write
+# scope and a user holding sales.change_salesconfig. See sales_followup.py for the
+# gate-safe helper that writes a body and moves DRAFT -> REVIEW.
+# ---------------------------------------------------------------------------
+
+def cmd_followups_check(args):
+    """Run the due-follow-up check now — same logic as the workday schedule.
+
+    Creates a DRAFT EmailTask for every lead whose cadence is due (idempotent:
+    leads with a pending draft are skipped).
+    POST /sales/config/enqueue-followups/ -> {created, skipped}.
+    """
+    data = _post('/api/v1/pat/sales/config/enqueue-followups/')
+    if args.json:
+        _json_out(data)
+        return
+    if isinstance(data, dict) and 'created' in data:
+        print(f'  Follow-up check: {data.get("created", 0)} draft email(s) created, '
+              f'{data.get("skipped", 0)} skipped (already pending)')
+    else:
+        _json_out(data)
+
+
+def cmd_email_tasks(args):
+    """List scheduled sales emails (`/sales/email-tasks/`). Filter by status.
+
+    The body IS the verbatim email. Confirmation is a human gate (off-PAT), so
+    this CLI can list/draft but never arm or send.
+    """
+    params = {}
+    if getattr(args, 'status', None):
+        params['status'] = args.status
+    if getattr(args, 'lead', None):
+        params['lead'] = args.lead
+    if getattr(args, 'limit', None):
+        params['page_size'] = args.limit
+    qs = ('?' + urllib.parse.urlencode(params)) if params else ''
+    data = _get(f'/api/v1/pat/sales/email-tasks/{qs}')
+    results = data.get('results', data) if isinstance(data, dict) else data
+
+    if args.json:
+        _json_out(results)
+        return
+
+    print(f'\n  SALES EMAIL TASKS ({len(results)})\n')
+    rows = []
+    for e in results:
+        summary = e.get('lead_summary') or {}
+        who = summary.get('company_name') or summary.get('person_name') or e.get('to_email', '')
+        rows.append([
+            e.get('id', ''),
+            e.get('status', ''),
+            who,
+            (e.get('subject', '') or '')[:40],
+            e.get('send_at') or '-',
+        ])
+    _table(['ID', 'Status', 'Customer', 'Subject', 'Send at'], rows)
+
+
+def cmd_email_task_set(args):
+    """Edit a draft email (`PATCH /sales/email-tasks/{id}/`).
+
+    Sets the body/subject/status. The server BLOCKS CONFIRMED/SENT/FAILED over a
+    PAT — confirmation is the human gate, and SENT/FAILED belong to the sender.
+    So this can move a draft DRAFT<->REVIEW and edit its text, nothing more.
+    """
+    body = {}
+    if getattr(args, 'body_file', None):
+        with open(args.body_file) as f:
+            body['body'] = f.read()
+    elif getattr(args, 'body', None) is not None:
+        body['body'] = args.body
+    if getattr(args, 'subject', None) is not None:
+        body['subject'] = args.subject
+    if getattr(args, 'status', None):
+        body['status'] = args.status
+    if getattr(args, 'to_email', None):
+        body['to_email'] = args.to_email
+    if not body:
+        print('  Nothing to update — pass --body/--body-file, --subject, --status, or --to-email.')
+        return
+
+    data = _request('PATCH', f'/api/v1/pat/sales/email-tasks/{args.id}/', body=body)
+    if args.json:
+        _json_out(data)
+        return
+    if isinstance(data, dict) and data.get('id'):
+        print(f'  EmailTask #{data["id"]} updated — status={data.get("status")}, subject={data.get("subject", "")!r}')
+    else:
+        _json_out(data)
+
+
+# ---------------------------------------------------------------------------
 # Commands: Clients (core — mounted at /pat/system/)
 # ---------------------------------------------------------------------------
 
@@ -1965,6 +2062,24 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser('pipeline-stages', help='Pipeline stages')
     p.add_argument('--pipeline', help='Filter by pipeline ID')
 
+    # followups-check (follow-up engine)
+    sub.add_parser('followups-check', help='Run the due-follow-up check now — creates DRAFT EmailTasks for due leads')
+
+    # email-tasks (follow-up engine — list scheduled sales emails)
+    p = sub.add_parser('email-tasks', help='List scheduled sales emails (the follow-up engine)')
+    p.add_argument('-f', '--status', help='Filter by status (DRAFT, REVIEW, CONFIRMED, SENT, FAILED, CANCELLED)')
+    p.add_argument('--lead', help='Filter by lead ID')
+    p.add_argument('--limit', type=int, help='Max rows')
+
+    # email-task-set (edit a draft email — never confirms/sends)
+    p = sub.add_parser('email-task-set', help='Edit a draft email body/subject/status (server blocks CONFIRMED/SENT/FAILED)')
+    p.add_argument('id', help='EmailTask ID')
+    p.add_argument('--body', help='Email body (the verbatim email)')
+    p.add_argument('--body-file', help='Read the email body from a file')
+    p.add_argument('--subject', help='Email subject')
+    p.add_argument('--to-email', dest='to_email', help='Recipient address')
+    p.add_argument('--status', help='DRAFT or REVIEW (CONFIRMED/SENT/FAILED are server-blocked over PAT)')
+
     # projects
     sub.add_parser('projects', help='PM projects')
 
@@ -2125,6 +2240,9 @@ COMMANDS = {
     'contracts': cmd_contracts,
     'pipelines': cmd_pipelines,
     'pipeline-stages': cmd_pipeline_stages,
+    'followups-check': cmd_followups_check,
+    'email-tasks': cmd_email_tasks,
+    'email-task-set': cmd_email_task_set,
     'projects': cmd_projects,
     'projects-update': cmd_projects_update,
     'project': cmd_project,
