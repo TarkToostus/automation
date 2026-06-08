@@ -45,6 +45,9 @@ tark_cli tasks
 | `tark_cli time week` | Weekly time report grouped by project |
 | `tark_cli projects` / `boards` / `columns` | Browse PM structure |
 | `tark_cli leads` / `offers` / `contracts` | Browse CRM |
+| `tark_cli followups-check` | Run the due-follow-up check now — creates DRAFT EmailTasks for due leads |
+| `tark_cli email-tasks -f DRAFT` | List scheduled sales emails (the follow-up engine), filter by status |
+| `tark_cli email-task-set <id> --body "..." --status REVIEW` | Edit a draft email's body/subject/status |
 | `tark_cli wiki 123` | Fetch task wiki markdown |
 | `tark_cli wiki 123 set --section Brief --body "..."` | Upsert a wiki section (preferred — dup-safe) |
 | `tark_cli wiki 123 append --section Brief --body "..."` | Append; refuses if section already exists |
@@ -56,6 +59,39 @@ tark_cli tasks
 | `tark_cli api <path> --post '{...}'` / `--patch '{...}'` | Generic POST / PATCH escape hatch |
 
 Run `tark_cli --help` for the full list, or `tark_cli <command> --help` for flags.
+
+## Sales follow-up engine
+
+The platform runs an in-product sales follow-up cadence. A due lead becomes a
+**DRAFT** `EmailTask` — a first-class scheduled email whose **body IS the verbatim
+email** (no transform between confirm and send), pre-filled with the lead's
+details (`{company}`, `{name}`). Two independent send gates protect it:
+
+```
+DRAFT  →  REVIEW  →  CONFIRMED  →  SENT / FAILED
+        (you draft)  (human       (platform sender:
+                      confirms +   status==CONFIRMED
+                      sets time)   AND send_at<=now)
+```
+
+Automation drives the **DRAFT → REVIEW** half only. **Confirmation is a human
+gate — not available over a PAT at all** (the serializer blocks a PAT from
+setting CONFIRMED/SENT/FAILED), and only the platform sender writes SENT/FAILED.
+Two surfaces:
+
+```bash
+tark_cli followups-check          # create DRAFT EmailTasks for every due lead now
+tark_cli email-tasks -f DRAFT     # list scheduled emails by status
+
+# The gate-safe assistant helper — writes the body and moves DRAFT -> REVIEW.
+# It HARD-REFUSES any move into CONFIRMED / SENT / FAILED (the human + sender own those).
+./sales_followup.py list
+./sales_followup.py draft 123 --subject "Acme + Tark — next step" --body "Tere, Anna! ..."
+```
+
+`followups-check` needs a PAT with `sales:write` scope held by a user with the
+`sales.change_salesconfig` permission; the `email-tasks` / `email-task-set`
+commands need `sales:write`.
 
 ## Auth
 
@@ -103,7 +139,7 @@ If you find a security issue, email `security@tarktoostus.ee` rather than openin
 PAT auth covers the workflow API surface:
 
 - `pm/` — projects, boards, columns, tasks, comments, time entries, timer
-- `sales/` — leads, offers, offer-lines, contracts, pipelines
+- `sales/` — leads, offers, offer-lines, contracts, pipelines, email-tasks (the follow-up engine), enqueue trigger (`config/enqueue-followups`)
 - `system/` — clients, contract-types, contract-templates
 - `c2/` — deployment status (read-only)
 
