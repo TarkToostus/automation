@@ -16,8 +16,8 @@ enforced server-side too (the serializer blocks a PAT from setting
 CONFIRMED/SENT/FAILED, and the sender only drains CONFIRMED); this script just
 makes the safe transition easy and the unsafe one impossible from automation.
 
-No safety bypass — it calls tark_cli with its checks on
-(per memory feedback_never_propose_cutting_safety).
+No safety bypass — it only ever drives the DRAFT -> REVIEW transition through
+tark_cli and refuses to touch anything past REVIEW; it never passes --no-safety.
 
 Subcommands:
     list                       DRAFT emails awaiting a body (table, or --json).
@@ -113,10 +113,15 @@ def cmd_list(args: argparse.Namespace) -> None:
 
 
 def cmd_draft(args: argparse.Namespace) -> None:
+    # Forward --body-file as a path (don't slurp it into an argv string: keeps the
+    # body out of the process table and off the ARG_MAX ceiling). Validate up front
+    # so a missing file is a clean error, not a traceback from the child process.
     if args.body_file:
-        body = Path(args.body_file).read_text()
+        if not Path(args.body_file).is_file():
+            die(f'draft: --body-file not found: {args.body_file}', rc=1)
+        body_args = ['--body-file', args.body_file]
     elif args.body is not None:
-        body = args.body
+        body_args = ['--body', args.body]
     else:
         die('draft needs --body <text> or --body-file <path>', rc=1)
 
@@ -129,12 +134,15 @@ def cmd_draft(args: argparse.Namespace) -> None:
             f'Automation never sets those.',
             rc=3,
         )
-    if status and status not in DRAFTABLE_STATUSES:
+    # Fail CLOSED: only an explicitly DRAFT/REVIEW email is draftable. A missing or
+    # unknown status refuses rather than proceeding — the gate-safe contract is that
+    # automation can never act on a status it doesn't recognise.
+    if status not in DRAFTABLE_STATUSES:
         die(f'REFUSE: EmailTask #{args.email_task_id} is {status!r}, not DRAFT/REVIEW — not draftable.', rc=3)
 
     # Write the body (+ subject) and move DRAFT -> REVIEW in one PATCH. The server
     # blocks any status past REVIEW, so this can never arm or send.
-    cli_args = ['email-task-set', args.email_task_id, '--body', body, '--status', TARGET_STATUS]
+    cli_args = ['email-task-set', args.email_task_id, *body_args, '--status', TARGET_STATUS]
     if args.subject is not None:
         cli_args += ['--subject', args.subject]
     rc, out, err = run_cli(*cli_args)
