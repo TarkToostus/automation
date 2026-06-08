@@ -45,6 +45,7 @@ tark_cli tasks
 | `tark_cli time week` | Weekly time report grouped by project |
 | `tark_cli projects` / `boards` / `columns` | Browse PM structure |
 | `tark_cli leads` / `offers` / `contracts` | Browse CRM |
+| `tark_cli leads create --title "Acme retrofit" --company "Acme OÜ" --pipeline Imports --source COLD` | Create a lead (needs `sales:write` PAT) |
 | `tark_cli followups-check` | Run the due-follow-up check now — creates DRAFT EmailTasks for due leads |
 | `tark_cli email-tasks -f DRAFT` | List scheduled sales emails (the follow-up engine), filter by status |
 | `tark_cli email-task-set <id> --body "..." --status REVIEW` | Edit a draft email's body/subject/status |

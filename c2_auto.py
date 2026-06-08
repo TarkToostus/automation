@@ -22,6 +22,8 @@ Subcommands:
         --brief-file <path>         Brief markdown (must contain required sections).
         --plan-file <path>          Plan markdown (must contain required sections).
         --force-overwrite           Allow PLAN_REVIEW overwrite (skill must confirm).
+        --wiki-only                 Write the wiki sections but DON'T advance/move
+                                    (wiki-fill is free; the WORK move is the gate).
     status <task_id> <column>       Move to a human-owned column by name.
     summary <task_id>               Print column, stage, last wiki section.
 """
@@ -168,6 +170,34 @@ def validate_required_sections(label: str, body: str, required: tuple[str, ...])
     return [s for s in required if s not in body]
 
 
+def demote_inner_headings(body: str) -> str:
+    """Demote top-level (## ) headings in a Brief/Plan body to ### .
+
+    The daemon WorkEngine reads a section as the text between '## <Section>' and
+    the NEXT '## ' line (daemon/cli_tools/c2.py:_extract_section, regex
+    ``^## Brief\\s*\\n(.*?)(?=^## |\\Z)``). A brief/plan body whose sub-sections
+    are '## Problem', '## Goals', ... renders them as SIBLING top-level h2 in the
+    wiki, so '## Brief' captures an empty body and the worker builds blind from
+    the task title (the #4455 failure). Demoting the inner headings to '### '
+    keeps them nested inside the section so the whole body is captured.
+
+    Fenced code blocks are skipped — a '## ' inside a ``` / ~~~ block is content,
+    not a heading. h1 ('# ') is left alone (it does not terminate the regex).
+    """
+    out: list[str] = []
+    in_fence = False
+    for line in body.splitlines():
+        if line.lstrip().startswith(("```", "~~~")):
+            in_fence = not in_fence
+        elif not in_fence and line.startswith("## "):
+            line = "#" + line  # '## X' -> '### X'
+        out.append(line)
+    result = "\n".join(out)
+    if body.endswith("\n"):
+        result += "\n"
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Subcommands
 # ---------------------------------------------------------------------------
@@ -291,6 +321,12 @@ def cmd_promote(args: argparse.Namespace) -> None:
         "Plan confirmed at chat-write time; no separate adversarial review pass."
     )
 
+    # Demote inner '## ' sub-headings to '### ' so the daemon WorkEngine can read
+    # the ## Brief / ## Plan bodies (see demote_inner_headings — the #4455 fix).
+    # Validation above ran on the original h2 content, so this is safe here.
+    brief = demote_inner_headings(brief)
+    plan = demote_inner_headings(plan)
+
     # Write three wiki sections (set = upsert).
     for section, body in (("Brief", brief), ("Plan", plan), ("Review: Plan", review_body)):
         rc, out, err = run_cli(
@@ -301,6 +337,20 @@ def cmd_promote(args: argparse.Namespace) -> None:
                 f"wiki set {section!r} failed (rc={rc}): {err.strip() or out.strip()}",
                 rc=1,
             )
+
+    # --wiki-only: the wiki fill is "free" (the analysis already lives in the
+    # chat — write it down), but the move to WORK is the human plan-confirm gate.
+    # Stop here without advancing the stage or moving the column. Re-running
+    # promote without --wiki-only later is idempotent on the wiki (upsert) and
+    # performs the canonical advance + move. See /c2-auto "wiki-fill is free".
+    if getattr(args, "wiki_only", False):
+        brief_lead = brief.lstrip().splitlines()[0][:80]
+        plan_lead = plan.lstrip().splitlines()[0][:80]
+        print(f"OK: #{args.task_id} wiki filled (Brief + Plan + Review: Plan); stays on {col} — NOT promoted")
+        print(f"Brief: {brief_lead}")
+        print(f"Plan:  {plan_lead}")
+        print("Promote to WORK after confirm (same args, drop --wiki-only).")
+        return
 
     # Forward-only stage advance: jump from current stage up to 'work'.
     cur_stage = stage_of(task)
@@ -393,6 +443,11 @@ def build_parser() -> argparse.ArgumentParser:
     pr.add_argument(
         "--force-overwrite", action="store_true",
         help="Allow promote from PLAN_REVIEW (overwrites daemon plan)",
+    )
+    pr.add_argument(
+        "--wiki-only", action="store_true",
+        help="Write Brief/Plan/Review:Plan to the wiki but do NOT advance stage "
+             "or move to WORK (the WORK move is the human plan-confirm gate)",
     )
     pr.set_defaults(func=cmd_promote)
 
