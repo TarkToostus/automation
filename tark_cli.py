@@ -1339,11 +1339,13 @@ def cmd_pipeline_stages(args):
 
 
 # ---------------------------------------------------------------------------
-# Commands: Sales follow-up engine (C2 #4600) — cadence board triggers.
-# Both only CREATE IDEA cards / ensure the board (the safe end of the board);
-# neither can cross the SEND human-gate. Need a PAT with sales:write scope and a
-# user holding sales.change_salesconfig. See sales_followup.py for the gate-safe
-# draft/move helper that drives a card from IDEA -> REVIEW.
+# Commands: Sales follow-up engine (C2 #4600) — EmailTask cadence.
+# A due lead becomes a DRAFT EmailTask whose body IS the verbatim email.
+# followups-check enqueues DRAFTs; email-tasks lists them; email-task-set edits a
+# draft's body/subject/status. None can cross the SEND human-gate — the server
+# blocks a PAT from setting CONFIRMED/SENT/FAILED. Need a PAT with sales:write
+# scope and a user holding sales.change_salesconfig. See sales_followup.py for the
+# gate-safe helper that writes a body and moves DRAFT -> REVIEW.
 # ---------------------------------------------------------------------------
 
 def cmd_followups_check(args):

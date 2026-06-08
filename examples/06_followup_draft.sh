@@ -20,6 +20,10 @@ else
 fi
 FOLLOWUP="$(dirname "$0")/../sales_followup.py"
 
+# sales_followup.py shells out to tark_cli (defaulting to ~/bin/tark_cli) — point it
+# at the same CLI this script resolved, so the checkout-local fallback works too.
+export TARK_CLI="$TARK"
+
 # 1. Pull in any due follow-ups (creates DRAFT EmailTasks).
 $TARK followups-check
 
