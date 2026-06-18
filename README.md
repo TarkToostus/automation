@@ -4,20 +4,32 @@ Command-line client and example scripts for the **Tark Platform** API.
 
 Authenticates against any Tark deployment using a Personal Access Token (PAT). Single-file Python script, stdlib only — no `pip install` required.
 
+> **New to this / non-technical?** See **[ONBOARDING.md](ONBOARDING.md)** — it gets
+> you researching prospects and firing leads with **zero developer setup** (no git,
+> Homebrew, or Xcode). Easiest path: open **https://claude.ai/code** and pick this repo.
+
 ## Quickstart
 
+You only need **Python 3** (stdlib only — no `pip install`). `git` is optional.
+
 ```bash
-# 1. Clone
-git clone https://github.com/TarkToostus/automation.git
-cd automation
+# 1a. Get the CLI WITHOUT git (one file, public repo):
+curl -fsSL https://raw.githubusercontent.com/TarkToostus/automation/main/tark_cli.py -o tark_cli.py
+chmod +x tark_cli.py
+# 1b. ...or with git, if you have it:
+#     git clone https://github.com/TarkToostus/automation.git && cd automation
 
 # 2. Configure (replace with your deployment + PAT)
-./tark_cli.py config set url https://your-deployment.tarkaeg.ee
+./tark_cli.py config set url https://your-deployment.tarktoostus.ee
 ./tark_cli.py config set pat tark_pat_xxxxxxxxxxxxx
 
 # 3. First call
 ./tark_cli.py tasks
 ```
+
+> One-shot installer (Claude Code + CLI + config, no git/Node/Xcode):
+> `curl -fsSL https://raw.githubusercontent.com/TarkToostus/automation/main/setup.sh | bash`
+> (Windows: `irm https://raw.githubusercontent.com/TarkToostus/automation/main/setup.ps1 | iex`)
 
 > Get a PAT from your deployment: **Profile → Security → API keys → Add token**.
 > Treat it like a password. It inherits your user's permissions.
@@ -27,7 +39,10 @@ cd automation
 Optional. Symlink it onto your `PATH`:
 
 ```bash
-ln -s "$PWD/tark_cli.py" ~/bin/tark_cli
+mkdir -p ~/bin
+ln -sf "$PWD/tark_cli.py" ~/bin/tark_cli
+# ~/bin must be on PATH — if `tark_cli` isn't found, add this to ~/.zshrc and reopen the shell:
+#   export PATH="$HOME/bin:$PATH"
 tark_cli tasks
 ```
 
