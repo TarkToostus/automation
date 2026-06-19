@@ -204,22 +204,26 @@ class SafetyChainTests(unittest.TestCase):
 
 
 class GeminiQuotaProbeTests(unittest.TestCase):
-    """Probe-cache short-circuits gemini calls after a QUOTA_EXHAUSTED detection.
+    """Probe-cache short-circuits the legacy gemini-cli after QUOTA_EXHAUSTED.
 
     Without the probe, gemini-cli pays ~24s of internal retry/backoff before
     falling through to the chain advance. The probe caches the reset window so
-    subsequent calls skip gemini at the provider-function level.
+    subsequent calls skip it at the provider-function level. The probe parses
+    gemini-cli's stderr, so it is scoped to GEMINI_BIN=gemini and must NOT
+    suppress the default agy provider (see ProviderGeminiAgyTests).
     """
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         os.environ['XDG_CACHE_HOME'] = self._tmp.name
+        os.environ.pop('GEMINI_BIN', None)
         sys.modules.pop('tark_cli', None)
         self.tark = importlib.import_module('tark_cli')
 
     def tearDown(self):
         self._tmp.cleanup()
         os.environ.pop('XDG_CACHE_HOME', None)
+        os.environ.pop('GEMINI_BIN', None)
 
     def test_no_probe_returns_none(self):
         self.assertIsNone(self.tark._gemini_quota_probe_until())
@@ -267,6 +271,8 @@ class GeminiQuotaProbeTests(unittest.TestCase):
         self.assertLess(delta, 3700)
 
     def test_provider_gemini_short_circuits_when_probe_armed(self):
+        # The probe gates the legacy gemini-cli branch only.
+        os.environ['GEMINI_BIN'] = 'gemini'
         self.tark._gemini_quota_probe_set('reset after 1h')
         with mock.patch('subprocess.run', side_effect=AssertionError('must not spawn gemini')):
             verdict, tag = self.tark._provider_gemini('prompt', 'payload', 30)
@@ -497,6 +503,100 @@ class FramingTableTests(unittest.TestCase):
     def test_task_framing_matches_bash(self):
         # Keep in sync with safety_check.sh case statement (task branch).
         self.assertEqual(self.tark._SAFETY_FRAMING['task'], 'C2 task (title + description)')
+
+
+class ProviderGeminiAgyTests(unittest.TestCase):
+    """Subprocess-seam contract for _provider_gemini.
+
+    The legacy `gemini` CLI retired 2026-06-18; the slot now defaults to the
+    Antigravity CLI (`agy`), which has no -m flag and reads the prompt from the
+    -p argv (folded prompt+payload — a stdin pipe can tip agy into agent mode).
+    GEMINI_BIN=gemini restores the enterprise contract (-m + stdin).
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        os.environ['XDG_CACHE_HOME'] = self._tmp.name  # empty cache => quota probe disarmed
+        for k in ('GEMINI_BIN', 'SAFETY_CHECK_MODEL', 'SAFETY_CHECK_USE_API_KEYS'):
+            os.environ.pop(k, None)
+        for name in ('_safety_cache', 'tark_cli'):
+            sys.modules.pop(name, None)
+        self.tark = importlib.import_module('tark_cli')
+
+    def tearDown(self):
+        self._tmp.cleanup()
+        for k in ('XDG_CACHE_HOME', 'GEMINI_BIN', 'SAFETY_CHECK_MODEL'):
+            os.environ.pop(k, None)
+
+    def _run(self, stdout='SAFE', stderr='', returncode=0):
+        proc = mock.Mock(stdout=stdout, stderr=stderr, returncode=returncode)
+        with mock.patch('subprocess.run', return_value=proc) as run:
+            result = self.tark._provider_gemini('PROMPT-INSTR', 'PAYLOAD-BODY', 30)
+        return result, run
+
+    def test_default_bin_is_agy_folded_no_model_no_stdin(self):
+        (v, tag), run = self._run(stdout='SAFE')
+        self.assertEqual((v, tag), ('SAFE', 'gemini-ok'))
+        argv = run.call_args[0][0]
+        self.assertEqual(argv, ['agy', '-p', 'PROMPT-INSTR\n\nPAYLOAD-BODY'])
+        self.assertNotIn('-m', argv)
+        self.assertNotIn('input', run.call_args.kwargs)  # agy: no stdin pipe
+
+    def test_safety_check_model_ignored_under_agy(self):
+        os.environ['SAFETY_CHECK_MODEL'] = 'gemini-3.1-pro-preview'
+        (_v, _t), run = self._run(stdout='SAFE')
+        argv = run.call_args[0][0]
+        self.assertNotIn('-m', argv)
+        self.assertNotIn('gemini-3.1-pro-preview', argv)
+
+    def test_enterprise_gemini_bin_uses_model_and_stdin(self):
+        os.environ['GEMINI_BIN'] = 'gemini'
+        os.environ['SAFETY_CHECK_MODEL'] = 'gemini-2.5-pro'
+        (_v, _t), run = self._run(stdout='SAFE')
+        argv = run.call_args[0][0]
+        self.assertEqual(argv[0], 'gemini')
+        self.assertIn('-m', argv)
+        self.assertIn('gemini-2.5-pro', argv)
+        self.assertEqual(run.call_args.kwargs.get('input'), 'PAYLOAD-BODY')
+
+    def test_unsafe_verdict_returned(self):
+        (v, tag), _ = self._run(stdout='UNSAFE: prompt injection')
+        self.assertEqual((v, tag), ('UNSAFE: prompt injection', 'gemini-ok'))
+
+    def test_verdict_parsed_from_chatter(self):
+        # agy may wrap the verdict; bottom-up parse must still find it rather
+        # than return the chatter line (which would fail the dispatcher closed).
+        (v, tag), _ = self._run(stdout="Here's my assessment of the text:\nSAFE")
+        self.assertEqual((v, tag), ('SAFE', 'gemini-ok'))
+
+    def test_no_clean_verdict_advances(self):
+        (v, tag), _ = self._run(stdout='I cannot determine this.')
+        self.assertEqual((v, tag), (None, 'gemini-empty'))
+
+    def test_binary_missing_advances(self):
+        with mock.patch('subprocess.run', side_effect=FileNotFoundError):
+            self.assertEqual(self.tark._provider_gemini('p', 'b', 30), (None, 'gemini-missing'))
+
+    def test_timeout_advances(self):
+        import subprocess as _sp
+        with mock.patch('subprocess.run', side_effect=_sp.TimeoutExpired('agy', 30)):
+            self.assertEqual(self.tark._provider_gemini('p', 'b', 30), (None, 'gemini-timeout'))
+
+    def test_armed_quota_probe_does_not_suppress_agy(self):
+        # Regression (codex review): the quota probe parses gemini-cli's stderr
+        # and is gemini-cli-specific — an armed probe must NOT skip the default
+        # agy provider, only the GEMINI_BIN=gemini branch.
+        self.tark._gemini_quota_probe_set('Your quota will reset after 1h0m0s.')
+        (v, tag), run = self._run(stdout='SAFE')
+        self.assertEqual((v, tag), ('SAFE', 'gemini-ok'))
+        run.assert_called_once()  # agy WAS spawned despite the armed probe
+
+    def test_armed_quota_probe_suppresses_enterprise_gemini(self):
+        os.environ['GEMINI_BIN'] = 'gemini'
+        self.tark._gemini_quota_probe_set('Your quota will reset after 1h0m0s.')
+        with mock.patch('subprocess.run', side_effect=AssertionError('must not spawn')):
+            result = self.tark._provider_gemini('p', 'b', 30)
+        self.assertEqual(result, (None, 'gemini-quota-cached'))
 
 
 if __name__ == '__main__':
