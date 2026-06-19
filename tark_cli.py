@@ -216,7 +216,7 @@ def _put(path: str, body: dict | None = None) -> dict | list:
 
 
 # ---------------------------------------------------------------------------
-# Safety screen — keep prompt identical to orchestrator/runners/lib/safety_check.sh.
+# Safety screen — fail-closed LLM screen with a multi-provider fallback chain.
 # ---------------------------------------------------------------------------
 
 _SAFETY_PROMPT = (
@@ -265,17 +265,19 @@ def _safety_enabled(force: bool) -> bool:
 #
 # Subscription-first auth policy: every provider runs with API-key env vars
 # scrubbed by default so vendors fall through to the user's subscription /
-# OAuth credentials on disk (gemini OAuth in ~/.gemini, codex ChatGPT-mode in
-# ~/.codex/auth.json, claude keychain in ~/.claude). Set
-# SAFETY_CHECK_USE_API_KEYS=1 to pass GEMINI_API_KEY / OPENAI_API_KEY /
-# ANTHROPIC_API_KEY through (metered billing — opt-in only).
+# OAuth credentials on disk (agy/Antigravity Google sign-in in
+# ~/.gemini/antigravity-cli, codex ChatGPT-mode in ~/.codex/auth.json, claude
+# keychain in ~/.claude). Set SAFETY_CHECK_USE_API_KEYS=1 to pass
+# GEMINI_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY through (metered billing
+# — opt-in only).
 
 _API_KEY_VARS = ('GEMINI_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY')
 
-# Quota-out probe: when gemini returns QUOTA_EXHAUSTED, we cache the reset
-# timestamp here so subsequent calls skip gemini immediately instead of waiting
-# 24s for its internal retry/backoff. Shared with safety_check.sh (same path,
-# same epoch-seconds format).
+# Quota-out probe (gemini-cli-specific): when the enterprise `gemini` CLI
+# returns QUOTA_EXHAUSTED, we cache the reset timestamp here so subsequent
+# calls skip it immediately instead of waiting ~24s for its internal
+# retry/backoff. Dormant under the default `agy` binary (different error
+# format), kept for GEMINI_BIN=gemini installs.
 _GEMINI_QUOTA_PROBE_REL = 'tark_cli/gemini_quota_out'
 
 
@@ -347,7 +349,7 @@ def _safety_subprocess_env() -> dict[str, str]:
               'NVM_DIR', 'NODE_PATH'):
         if k in os.environ:
             env[k] = os.environ[k]
-    # API-key opt-in — explicit and global, mirrored in safety_check.sh.
+    # API-key opt-in — explicit and global.
     if os.environ.get('SAFETY_CHECK_USE_API_KEYS') == '1':
         for k in _API_KEY_VARS:
             if os.environ.get(k):
@@ -359,29 +361,48 @@ def _safety_subprocess_env() -> dict[str, str]:
 
 
 def _provider_gemini(prompt: str, payload: str, timeout: int) -> tuple[str | None, str]:
-    # Fast-fail: if gemini was quota-out recently, skip without spawning the
-    # subprocess at all. Saves ~24s per call against a known wall.
-    if _gemini_quota_probe_until() is not None:
-        return None, 'gemini-quota-cached'
-
-    cmd = ['gemini']
-    if os.environ.get('SAFETY_CHECK_MODEL'):
-        cmd += ['-m', os.environ['SAFETY_CHECK_MODEL']]
-    cmd += ['-p', prompt]
+    # The Google slot of the chain. The legacy `gemini` CLI retired 2026-06-18
+    # for individual tiers; GEMINI_BIN (default 'agy', the Antigravity CLI)
+    # selects the binary, mirroring orchestrator/runners/proof/gemini_verifier.py.
+    bin_ = os.environ.get('GEMINI_BIN', 'agy')
+    if bin_ == 'gemini':
+        # Enterprise Gemini Code Assist: legacy CLI honors -m + payload on stdin.
+        # Fast-fail on a recent terminal quota wall — the probe parses gemini-cli's
+        # stderr format, so it is scoped to this branch (must NOT suppress agy).
+        if _gemini_quota_probe_until() is not None:
+            return None, 'gemini-quota-cached'
+        cmd = ['gemini']
+        if os.environ.get('SAFETY_CHECK_MODEL'):
+            cmd += ['-m', os.environ['SAFETY_CHECK_MODEL']]
+        cmd += ['-p', prompt]
+        run_kwargs: dict = {'input': payload}
+    else:
+        # Antigravity CLI (`agy`): no -m (auto-selects Gemini 3.5 Flash). It is
+        # agentic, so fold prompt+payload into the -p argv — a stdin pipe or a
+        # bare instruction can tip it into search/agent mode and hang. Deliberately
+        # NO --dangerously-skip-permissions: a content-safety screen must never
+        # auto-approve a tool the screened text might invoke; if agy ever requests
+        # one it blocks until the timeout below advances the chain (fail-safe).
+        cmd = [bin_, '-p', f'{prompt}\n\n{payload}']
+        run_kwargs = {}
     try:
-        proc = subprocess.run(cmd, input=payload, capture_output=True, text=True,
-                              timeout=timeout, env=_safety_subprocess_env())
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout, env=_safety_subprocess_env(),
+                              **run_kwargs)
     except FileNotFoundError:
         return None, 'gemini-missing'
     except subprocess.TimeoutExpired:
+        # subprocess.run SIGKILLs + reaps the child here; agy runs its language
+        # server in-process (no orphaned child to leak).
         return None, 'gemini-timeout'
     err = proc.stderr or ''
-    lines = [ln.strip() for ln in (proc.stdout or '').splitlines() if ln.strip()]
-    verdict = lines[-1] if lines else ''
+    # Parse like codex/claude (bottom-up for an exact SAFE / UNSAFE: line) rather
+    # than blindly taking the last line: agy may wrap the verdict in chatter, and
+    # returning chatter would fail the dispatcher CLOSED instead of advancing.
+    verdict = _parse_verdict_line(proc.stdout or '')
     # Terminal quota in stderr → arm probe + advance, but ONLY if stdout has no
-    # verdict. gemini-cli retries QUOTA_EXHAUSTED internally and sometimes
-    # succeeds — the retry trace stays in stderr while the verdict lands on
-    # stdout. Prefer the verdict in that case; don't lock out the provider.
+    # verdict (the CLI may retry quota internally and still land one). gemini-cli
+    # only; agy's quota errors don't match these strings.
     if not verdict and ('QUOTA_EXHAUSTED' in err or 'exhausted your capacity' in err):
         _gemini_quota_probe_set(err)
         return None, 'gemini-quota'
