@@ -1022,6 +1022,37 @@ def cmd_time(args):
     print()
 
 
+def cmd_time_summary(args):
+    """Manager-scoped time summary: hours per user x ISO-week (server-aggregated).
+
+    GET /api/v1/pat/pm/time-summary/?group_by=user,week&start=&end= (scope pm:read).
+    A non-manager PAT sees ONLY its own rows (default-deny cross-user); a manager
+    (can_view_all_pm_projects) sees the whole tenant. The sum is computed in the
+    DB, never client-side.
+    """
+    params = {'group_by': args.group_by or 'user,week'}
+    if args.start:
+        params['start'] = args.start
+    if args.end:
+        params['end'] = args.end
+    qs = '?' + urllib.parse.urlencode(params)
+    data = _get(f'/api/v1/pat/pm/time-summary/{qs}')
+    rows = data if isinstance(data, list) else data.get('results', [])
+
+    if args.json:
+        _json_out(rows)
+        return
+
+    total = sum(float(r.get('total_hours', 0)) for r in rows)
+    print(f'\n  TIME SUMMARY ({len(rows)} rows, {total:.1f}h total)\n')
+    _table(
+        ['User', 'Week', 'Hours'],
+        [[r.get('user_name', r.get('user_id', '?')), r.get('week', '-'),
+          f'{float(r.get("total_hours", 0)):.1f}h'] for r in rows],
+    )
+    print()
+
+
 # ---------------------------------------------------------------------------
 # Commands: Leads
 # ---------------------------------------------------------------------------
@@ -1459,6 +1490,28 @@ def cmd_email_task_set(args):
 # ---------------------------------------------------------------------------
 # Commands: Clients (core — mounted at /pat/system/)
 # ---------------------------------------------------------------------------
+
+def cmd_users(args):
+    """List the tenant user roster (id + first/last + username + active).
+
+    GET /api/v1/pat/system/users/ (scope users:read). Minimal-PII, tenant-scoped
+    server-side, ordered by last name. The LLM-assistant "list users" surface.
+    """
+    data = _get('/api/v1/pat/system/users/')
+    results = data if isinstance(data, list) else data.get('results', data)
+    if args.json:
+        _json_out(results)
+        return
+    if getattr(args, 'limit', None):
+        results = results[: int(args.limit)]
+    print(f'\n  USERS ({len(results)})\n')
+    _table(
+        ['ID', 'Last', 'First', 'Username', 'Active'],
+        [[u.get('id'), u.get('last_name', ''), u.get('first_name', ''),
+          u.get('username', ''), 'yes' if u.get('is_active') else 'no'] for u in results],
+    )
+    print()
+
 
 def cmd_clients(args):
     """List tenant clients. Tenant-scoped server-side."""
@@ -2048,6 +2101,16 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser('time', help='Time report')
     p.add_argument('period', nargs='?', choices=['today', 'week', 'month'], default='week')
 
+    # time-summary [--group-by] [--start] [--end]
+    p = sub.add_parser('time-summary', help='Manager-scoped time summary: hours per user x ISO-week (needs pm:read)')
+    p.add_argument('--group-by', dest='group_by', default='user,week', help='Dimensions: user, week, or user,week (default: user,week)')
+    p.add_argument('--start', help='Inclusive start date YYYY-MM-DD')
+    p.add_argument('--end', help='Inclusive end date YYYY-MM-DD')
+
+    # users
+    p = sub.add_parser('users', help='Tenant user roster (id + first/last + username, needs users:read)')
+    p.add_argument('--limit', type=int, help='Max rows to display')
+
     # leads [list|create]
     p = sub.add_parser('leads', help='Sales leads — browse, or `create`')
     p.add_argument('action', nargs='?', choices=['list', 'create'], help='Default: list. `create` opens a new lead (needs sales:write PAT).')
@@ -2255,6 +2318,8 @@ COMMANDS = {
     'discard': cmd_discard,
     'log': cmd_log,
     'time': cmd_time,
+    'time-summary': cmd_time_summary,
+    'users': cmd_users,
     'leads': cmd_leads,
     'offers': cmd_offers,
     'offer-lines': cmd_offer_lines,
