@@ -13,6 +13,8 @@ runs `git commit` / `gh pr` (the deliberate content-ops-only boundary).
     website from-proof TASK [--page R]     # reuse /verify .proof shots as help step shots
                        [--dest DIR] [--no-article] [--build] [--sync]
     website persist-proof TASK --page R --dest DIR   # copy+rename shots only (/pr Step 7b step a)
+    website release-note --date D          # scaffold a docu/help/releases/ entry DRAFT (+ee mirror)
+                       [--tasks ID,ID] [--slugs module/slug,...]
     website refresh [--from-proof TASK --page R] [--clean]
                     [--skip-capture] [--skip-build] [--skip-website] [--commit] [--push]
 
@@ -35,6 +37,7 @@ import re
 import shutil
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -209,6 +212,197 @@ def scaffold_article(repo, module, slug, route, proof_dir):
 
 
 # ---------------------------------------------------------------------------
+# release-note: scaffold a docu/help/releases/ entry from tasks/slugs
+# ---------------------------------------------------------------------------
+
+# Section header /pr Step 7b writes the help-article slug under, so a later
+# `release-note --tasks <id>` resolves module/slug without re-deriving the
+# route->module mapping. Keep in sync with .claude/commands/pr.md Step 7b.
+WIKI_HELP_SECTION = "Help Article"
+
+# Matches a "module/slug" token (lowercase kebab segments).
+_SLUG_TOKEN_RE = re.compile(r"\b([a-z0-9][a-z0-9-]*)/([a-z0-9][a-z0-9-]*)\b")
+# A single path segment (module or slug) — anchors path resolution to help/.
+_SEGMENT_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+# A wiki line that is JUST a slug (optionally bulleted/backticked) — what /pr writes.
+_SLUG_LINE_RE = re.compile(r"^\s*[-*]?\s*`?([a-z0-9][a-z0-9-]*/[a-z0-9][a-z0-9-]*)`?\s*$")
+
+
+def _tark_cli_cmd():
+    """Command prefix for invoking the peer tark_cli (sibling file, else PATH)."""
+    sibling = Path(__file__).resolve().parent / "tark_cli.py"
+    if sibling.exists():
+        return [sys.executable, str(sibling)]
+    return ["tark_cli"]
+
+
+def _wiki_help_slug(task_id):
+    """Best-effort: read the C2 task wiki's 'Help Article' section for a module/slug.
+
+    Returns 'module/slug' or None. Read-only, network best-effort — any failure
+    (no tark_cli, non-zero exit, missing section) returns None so the caller
+    [WARN]s and skips, never fails hard.
+    """
+    cmd = _tark_cli_cmd() + ["--no-safety", "wiki", str(task_id), "get"]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    m = re.search(r"(?im)^##\s+" + re.escape(WIKI_HELP_SECTION) + r"\s*\n(.*?)(?=^##\s|\Z)",
+                  out.stdout or "", re.DOTALL)
+    if not m:
+        return None
+    section = m.group(1)
+    # Prefer a line that is JUST a slug (the shape /pr writes) to avoid matching
+    # a stray "git/github"-style token in prose; fall back to a loose search.
+    for line in section.splitlines():
+        lm = _SLUG_LINE_RE.match(line)
+        if lm:
+            return lm.group(1)
+    sm = _SLUG_TOKEN_RE.search(section)
+    return f"{sm.group(1)}/{sm.group(2)}" if sm else None
+
+
+def resolve_release_item(repo, spec):
+    """Resolve a 'module/slug' or a verified '/route' to (module, slug, en_title, ee_title, path).
+
+    Returns None when it cannot map to an existing article (caller [WARN]s and
+    skips, same failure class from-proof already flags). A leading '/' is run
+    through from-proof's route->module mapping; a bare 'module/slug' is looked
+    up directly under docu/help/. Both segments are validated against a kebab
+    pattern so a hostile spec ('../etc', '..\\x') cannot escape docu/help/.
+    """
+    spec = (spec or "").strip()
+    if not spec:
+        return None
+    if spec.startswith("/"):
+        module, slug, art = route_to_module_page(repo, spec)
+        if art is None:
+            return None
+    else:
+        parts = spec.strip("/").split("/")
+        if len(parts) != 2:
+            return None
+        module, slug = parts
+        if not (_SEGMENT_RE.match(module) and _SEGMENT_RE.match(slug)):
+            return None
+        art = repo / "docu" / "help" / module / f"{slug}.md"
+        if not art.exists():
+            return None
+    en_title = parse_frontmatter(art).get("title") or slug.replace("-", " ").title()
+    # Prefer the Estonian article title for the ee mirror (build-help.py overlay
+    # convention: docu/help/<module>/ee/<slug>.md); fall back to the en title.
+    ee_art = repo / "docu" / "help" / module / "ee" / f"{slug}.md"
+    ee_title = en_title
+    if ee_art.exists():
+        ee_title = parse_frontmatter(ee_art).get("title") or en_title
+    return module, slug, en_title, ee_title, art
+
+
+RELEASE_TEMPLATE = """---
+title: "{title}"
+date: {date}
+modules: [{modules}]
+order: {order}
+---
+
+> TODO curate: replace with customer-facing prose. Bullets are auto-generated
+> links; the wording is a manual pass, never generated.
+
+## {heading}
+
+{bullets}
+"""
+
+
+def _write_release(path, title, date, modules, order, heading, bullets):
+    """Write one release entry file if absent. Returns 'created'|'exists'."""
+    if path.exists():
+        return "exists"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        RELEASE_TEMPLATE.format(
+            title=title, date=date, modules=", ".join(modules), order=order,
+            heading=heading, bullets="\n".join(bullets),
+        ),
+        encoding="utf-8",
+    )
+    return "created"
+
+
+def cmd_release_note(args):
+    repo = resolve_repo(args)
+    try:
+        # Normalize to canonical zero-padded form so '2026-7-3' can't slip past
+        # strptime and produce a mis-sorting filename/order (e.g. -202673).
+        date = datetime.strptime(args.date, "%Y-%m-%d").strftime("%Y-%m-%d")
+    except ValueError:
+        sys.exit(f"[ERROR] --date '{args.date}' is not a valid YYYY-MM-DD date")
+    if not args.tasks and not args.slugs:
+        sys.exit("[ERROR] pass at least one of --tasks <id,...> or --slugs <module/slug,...>")
+
+    # Build the ordered work list: (origin_label, spec). Tasks resolve their
+    # slug via the C2 wiki (recorded by /pr Step 7b); slugs are used directly.
+    specs = []
+    for tid in [t.strip() for t in (args.tasks or "").split(",") if t.strip()]:
+        slug = _wiki_help_slug(tid)
+        if not slug:
+            print(f"[WARN] task {tid}: no '{WIKI_HELP_SECTION}' slug in its C2 wiki — skipping "
+                  f"(record it with `tark_cli wiki {tid} set --section \"{WIKI_HELP_SECTION}\" "
+                  f"--body module/slug`, or pass --slugs)")
+            continue
+        specs.append((f"task {tid}", slug))
+    for spec in [s.strip() for s in (args.slugs or "").split(",") if s.strip()]:
+        specs.append((f"slug {spec}", spec))
+
+    resolved = []  # (module, slug, en_title, ee_title)
+    seen = set()   # dedupe by (module, slug), preserve first-seen order
+    modules = []   # union, first-seen order
+    for label, spec in specs:
+        item = resolve_release_item(repo, spec)
+        if not item:
+            print(f"[WARN] {label}: '{spec}' matched no help article under docu/help/ — skipping")
+            continue
+        module, slug, en_title, ee_title, _ = item
+        if (module, slug) in seen:
+            continue
+        seen.add((module, slug))
+        resolved.append((module, slug, en_title, ee_title))
+        if module not in modules:
+            modules.append(module)
+
+    if not resolved:
+        print("[WARN] no articles resolved from tasks/slugs — nothing to scaffold")
+        return 1
+
+    primary_slug = resolved[0][1]
+    order = -int(date.replace("-", ""))  # newest-first under ascending sort
+    rel_dir = repo / "docu" / "help" / "releases"
+
+    en_bullets = [f"- See [{en_t}](/help-center/{m}/{s})." for m, s, en_t, ee_t in resolved]
+    ee_bullets = [f"- Vaata [{ee_t}](/help-center/{m}/{s})." for m, s, en_t, ee_t in resolved]
+
+    en_path = rel_dir / f"{date}-{primary_slug}.md"
+    ee_path = rel_dir / "ee" / f"{date}-{primary_slug}.md"
+
+    en_state = _write_release(en_path, f"Release {date}", date, modules, order,
+                              "Highlights", en_bullets)
+    ee_state = _write_release(ee_path, f"Väljalase {date}", date, modules, order,
+                              "Esiletõstetud", ee_bullets)
+
+    for state, path in ((en_state, en_path), (ee_state, ee_path)):
+        tag = "[OK]" if state == "created" else "[exists]"
+        verb = "scaffolded" if state == "created" else "left as-is"
+        print(f"{tag} {verb}: {path.relative_to(repo)}")
+    print(f"> {len(resolved)} highlight(s) across modules: {', '.join(modules)}")
+    print("> DRAFT only: customer-facing prose is a manual curation pass, never generated. "
+          "No build/sync run.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # subcommands
 # ---------------------------------------------------------------------------
 
@@ -370,6 +564,12 @@ def build_parser():
     s.add_argument("--dest", required=True, help="durable baselines dir (e.g. MAIN checkout's)")
     s.add_argument("--proof-dir", dest="proof_dir", help="explicit .proof screenshots dir override")
     s.set_defaults(func=cmd_persist_proof)
+
+    s = sub.add_parser("release-note", help="scaffold a docu/help/releases/ entry DRAFT (+ee) from tasks/slugs")
+    s.add_argument("--date", required=True, help="release date, YYYY-MM-DD (day-grain; drives filename + order)")
+    s.add_argument("--tasks", help="C2 task ids (comma-separated); slug read from each task's wiki 'Help Article' section")
+    s.add_argument("--slugs", help="help-article specs (comma-separated), each 'module/slug' or a verified '/route'")
+    s.set_defaults(func=cmd_release_note)
 
     s = sub.add_parser("refresh", help="full pipeline: [reseed] -> capture|from-proof -> build -> sync")
     s.add_argument("--from-proof", dest="from_proof", help="reuse this task's proofs instead of capturing")
