@@ -8,8 +8,13 @@ gate-safe `./sales_followup.py` helper.
 ## The loop
 1. **Research** a company → `/research-customer <url>` (built-in web search; writes a dossier).
 2. **Create a lead** → `./tark_cli.py leads create --title "..." --company "..." --pipeline Imports --source COLD`
-3. **Draft a follow-up** → `./sales_followup.py draft <lead-id> --subject "..." --body "..."`
-   (lands as a REVIEW email on Sales → Follow-ups).
+3. **Draft a follow-up** → `./sales_followup.py draft <email_task_id> --subject "..." --body "..."`
+   (lands as a REVIEW email on Sales → Follow-ups). `draft` takes an EMAIL TASK
+   id, not a lead id, and only edits an existing DRAFT. Get one from
+   `./tark_cli.py followups-check` (enqueues DRAFTs for cadence-due leads); for a
+   brand-new lead create one directly: `./tark_cli.py api sales/email-tasks
+   --post '{}'`, then `./tark_cli.py api sales/email-tasks/<id>/ --patch
+   '{"lead": <lead_id>}'`.
 4. **Human confirms + sends** in the Tark UI. You can NEVER send mail or set
    CONFIRMED/SENT — the PAT is blocked from those states by design. Don't try.
 

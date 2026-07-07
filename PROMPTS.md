@@ -31,8 +31,9 @@ Then write 5 Estonian email templates as markdown files in templates/:
 Each file: a YAML block with subject_template and the placeholders used, then
 the body. Use placeholders {{name}}, {{company}}, {{date_last_met}},
 {{last_discussion}}, {{open_question}} — they get filled from the lead's data
-later, so never write real facts into the template. Greeting "Tere, {{name}}!",
-sign-off "Parimat!" plus my signature block. 5-8 sentences per body, no fluff.
+later, so never write real facts into the template. Default greeting
+"Tere, {{name}}!" and sign-off "Parimat!" plus my signature block — but adjust
+both to the tone I chose above. 5-8 sentences per body, no fluff.
 Show me each template and adjust until I say it's good.
 ```
 
@@ -49,22 +50,23 @@ Create a Tark lead from that research — company name, contact person and email
 if found, source COLD. Then show me the lead.
 ```
 
-The lead appears in Tark under **Muuk -> Vihjed** (Sales -> Leads).
+The lead appears in Tark under **Müük → Vihjed** (Sales → Leads).
 
 ## 3. Draft the follow-up email
 
 ```
-Draft a follow-up email for that lead. Pick the best matching template from
+Draft a follow-up email for that lead. If the lead has no draft email task yet,
+create one first and link it to the lead. Pick the best matching template from
 templates/, fill the placeholders from the lead's real data (never invent
 facts), and put it in REVIEW.
 ```
 
-The email appears in Tark under **Muuk -> Jareltegevused** (Sales -> Follow-ups)
+The email appears in Tark under **Müük → Järeltegevused** (Sales → Follow-ups)
 with status REVIEW.
 
 ## 4. Send it (you, in Tark — not Claude)
 
-Open **Muuk -> Jareltegevused**, open the email, edit if needed, set the send
+Open **Müük → Järeltegevused**, open the email, edit if needed, set the send
 time, press **Confirm**. The platform sends it within ~5 minutes. This step is
 human-only by design.
 
