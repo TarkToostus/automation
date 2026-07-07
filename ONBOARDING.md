@@ -92,6 +92,9 @@ broken Mac you may have to install Python from the link it prints).
 
 ## The daily workflow — research → lead → follow-up
 
+> **Copy-paste versions of every prompt below — including a one-time "create my
+> email templates" setup — live in [PROMPTS.md](PROMPTS.md).** Start there.
+
 Once either path works, you drive everything in plain language inside Claude Code.
 The bundled **`/research-customer`** skill + `tark_cli` do the rest.
 
