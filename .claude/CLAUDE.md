@@ -13,6 +13,15 @@ gate-safe `./sales_followup.py` helper.
 4. **Human confirms + sends** in the Tark UI. You can NEVER send mail or set
    CONFIRMED/SENT — the PAT is blocked from those states by design. Don't try.
 
+## Email templates
+
+- If `templates/*.md` exist, every follow-up draft STARTS from the best-matching
+  template (file name = `{type}-{tier}.md`; YAML block lists subject_template +
+  placeholders). Fill `{{name}}`, `{{company}}`, `{{date_last_met}}`,
+  `{{last_discussion}}`, `{{open_question}}` from the lead's real data only.
+- If `templates/` is empty, offer the one-time setup prompt from `PROMPTS.md` §0
+  before drafting freehand.
+
 ## Rules
 - Config lives in `~/.config/tark/config.json` (set via `./tark_cli.py config set ...`).
   If a call 401s, the PAT/URL is wrong — tell the user to re-run the two `config set` lines.
