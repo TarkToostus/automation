@@ -749,15 +749,21 @@ def cmd_tasks(args):
         params['assignee'] = str(user_id)
 
     if args.project:
-        # Task → Board → Project; filter via board__project (task has no direct project FK)
+        # Task → BoardCard → Board → Project (task has no direct project FK).
+        # Param names must match TaskViewSet.filterset_fields exactly —
+        # DjangoFilterBackend silently DROPS unregistered params, which made
+        # these filters no-ops (C2 #5478: daemon reclaim swept unfiltered lists).
         try:
-            params['board__project'] = str(int(args.project))
+            params['board_card__board__project'] = str(int(args.project))
         except ValueError:
             project_id = _resolve_project(args.project)
-            params['board__project'] = str(project_id)
+            params['board_card__board__project'] = str(project_id)
+
+    if args.board:
+        params['board_card__board'] = str(int(args.board))
 
     if args.status:
-        params['column__name'] = args.status
+        params['board_card__column__name'] = args.status
 
     data = _get('/api/v1/pat/pm/tasks/', **params)
     results = data.get('results', data) if isinstance(data, dict) else data
@@ -2063,6 +2069,7 @@ def build_parser() -> argparse.ArgumentParser:
     # tasks
     p = sub.add_parser('tasks', help='List tasks')
     p.add_argument('--project', '-p', help='Filter by project name or ID')
+    p.add_argument('--board', '-b', help='Filter by board ID (a project can hold several boards)')
     p.add_argument('--status', '-s', help='Filter by column name (e.g. "In Progress")')
     p.add_argument('--all', '-a', action='store_true', help='Show all tasks (not just mine)')
 
