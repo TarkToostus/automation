@@ -61,7 +61,9 @@ tark_cli tasks
 | `tark_cli projects` / `boards` / `columns` | Browse PM structure |
 | `tark_cli boards-create <project_id> "Board name"` | Create a board (needs `pm:write`) |
 | `tark_cli comment <task_id> "text"` | Add a task comment (needs `pm:write`) |
-| `tark_cli task-delete <id> [--yes]` | Delete a task (needs `pm:delete`, **destructive** — confirms unless `--yes`) |
+| `tark_cli task-comment <id>` / `time-entry <id>` | Retrieve one comment / time entry |
+| `tark_cli time-update <id> --hours 2.5 --description "..."` | Patch a time entry (sparse, needs `pm:write`) |
+| `tark_cli task-delete <id> [--yes]` | Delete a task (needs `pm:delete`, **destructive** - confirms unless `--yes`) |
 | `tark_cli time-delete <id> [--yes]` | Delete a time entry (needs `pm:write`, **destructive**) |
 | `tark_cli sites-active --domains a.tt.ee,b.tt.ee [--window 15m]` | C2 sites active-now (needs `c2:read`) |
 | `tark_cli contract-blocks` | List contract blocks (system, `sales:read`) |
@@ -70,6 +72,12 @@ tark_cli tasks
 | `tark_cli offer-line-delete <id> [--yes]` | Delete an offer line (needs `sales:write`, **destructive**) |
 | `tark_cli leads` / `offers` / `contracts` | Browse CRM |
 | `tark_cli leads create --title "Acme retrofit" --company "Acme OÜ" --pipeline Imports --source COLD` | Create a lead (needs `sales:write` PAT) |
+| `tark_cli leads-update <id> --status QUALIFIED --pipeline-stage 4` | Patch a lead (sparse, only sends given flags) |
+| `tark_cli leads-ingest --pipeline Imports --leads '[{"title":"..."}]'` | Batch-create leads (dedupes by title) |
+| `tark_cli offers-create --title "..." --client 5 --amount 1500` / `offers-update <id> ...` | Create / patch an offer |
+| `tark_cli offer-lines-create --offer 3 --description "..." --quantity 2 --unit-price 99` / `offer-lines-update <id> ...` | Create / patch an offer line |
+| `tark_cli contracts-create --title "..." --client 2 --template 1` / `contracts-update <id> ...` | Create / patch a contract (content-JSON via `api`) |
+| `tark_cli email-tasks-create --lead 12 --subject "..." --body "..." --status REVIEW` | Draft a sales email (never confirms/sends) |
 | `tark_cli followups-check` | Run the due-follow-up check now — creates DRAFT EmailTasks for due leads |
 | `tark_cli email-tasks -f DRAFT` | List scheduled sales emails (the follow-up engine), filter by status |
 | `tark_cli email-task-set <id> --body "..." --status REVIEW` | Edit a draft email's body/subject/status |

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-tark — CLI for Tark Platform C2.
+tark - CLI for Tark Platform C2.
 
 Standalone Python script (stdlib only, no pip deps).
 Authenticates via PAT token against the C2 API.
 
-INVARIANT — every PAT-exposed API endpoint must have a CLI command.
+INVARIANT - every PAT-exposed API endpoint must have a CLI command.
     When you add or extend a resource in any `backend/*/api/pat_urls.py`,
     also add/update the matching `cmd_*` handler here. The generic
     `api <path>` command is the escape hatch for unreleased endpoints,
@@ -28,7 +28,10 @@ Usage (binary installed as `tark_cli` at ~/bin/tark_cli; examples below use that
     tark_cli column <id>                        # Board-column detail
     tark_cli comments [--task=X]                # List task comments
     tark_cli comment <task-id> <body>           # Add a task comment (pm:write)
+    tark_cli task-comment <id>                   # Task-comment detail
     tark_cli task-delete <id> [--yes]           # Delete a task (pm:delete, DESTRUCTIVE)
+    tark_cli time-entry <id>                     # Time-entry detail
+    tark_cli time-update <id> [--hours ... --description ...]  # Patch a time entry (pm:write)
     tark_cli time-delete <id> [--yes]           # Delete a time entry (pm:write, DESTRUCTIVE)
 
     tark_cli timer                          # Active timer
@@ -41,10 +44,19 @@ Usage (binary installed as `tark_cli` at ~/bin/tark_cli; examples below use that
 
     tark_cli leads                          # Sales leads
     tark_cli leads create --title "..." [--company X] [--pipeline Imports] [--source COLD]  # Create a lead
+    tark_cli leads-update <id> [--status X] [--pipeline-stage N] ...  # Patch a lead (sparse)
+    tark_cli leads-ingest --pipeline Imports --leads '[{"title":"..."}]'  # Batch-create leads
     tark_cli offers                         # Sales offers
+    tark_cli offers-create --title "..." [--client N] [--amount N] ...  # Create an offer (sales:write)
+    tark_cli offers-update <id> [--probability N] ...    # Patch an offer (sparse)
     tark_cli offer-lines [--offer=X]        # Offer line items
+    tark_cli offer-lines-create --offer N --description "..." [--quantity N --unit-price N]  # Create a line
+    tark_cli offer-lines-update <id> [--quantity N] ...  # Patch an offer line (sparse)
     tark_cli offer-line-delete <id> [--yes] # Delete an offer line (sales:write, DESTRUCTIVE)
     tark_cli contracts                      # Sales contracts
+    tark_cli contracts-create [--title X --client N --template N ...]  # Create a contract (content-JSON via `api`)
+    tark_cli contracts-update <id> [--status X] ...      # Patch a contract (sparse)
+    tark_cli email-tasks-create --lead N [--subject X --body X --status REVIEW]  # Draft an email (never sends)
     tark_cli pipelines                      # CRM pipelines
     tark_cli pipeline-stages [--pipeline=X] # Pipeline stages
     tark_cli contract-types                 # Contract types (system)
@@ -53,7 +65,7 @@ Usage (binary installed as `tark_cli` at ~/bin/tark_cli; examples below use that
     tark_cli sites-active --domains a,b     # C2 sites active-now (c2:read)
     tark_cli clients [--search=X]           # Tenant clients
 
-    # Detail (retrieve) by ID — one per PAT resource that allows retrieve:
+    # Detail (retrieve) by ID - one per PAT resource that allows retrieve:
     tark_cli {lead|offer|offer-line|contract|pipeline|pipeline-stage|email-task} <id>
     tark_cli {client|user|contract-type|contract-block|contract-template|column} <id>
     tark_cli ingest <project> <board> --tasks '[{"subject":"..."}]'   # Batch ingest PM tasks
@@ -95,7 +107,7 @@ import urllib.parse
 import urllib.request
 from datetime import date, datetime, timedelta
 
-# Sibling module — same directory. None-fallback keeps tark_cli working if the
+# Sibling module - same directory. None-fallback keeps tark_cli working if the
 # file is missing (degraded: no cache, every call re-runs gemini).
 try:
     import _safety_cache as _sc  # noqa: E402  (kept beside other stdlib imports)
@@ -232,11 +244,11 @@ def _put(path: str, body: dict | None = None) -> dict | list:
 
 
 # ---------------------------------------------------------------------------
-# JWT web-login auth — token management ONLY.
+# JWT web-login auth - token management ONLY.
 #
 # The /api/v1/pat/tokens/ endpoints reject PAT auth by design: a token must never
 # be able to mint or revoke tokens (privilege escalation). So token management
-# mirrors the C2 web UI — obtain a short-lived JWT via password login and use it
+# mirrors the C2 web UI - obtain a short-lived JWT via password login and use it
 # for that one request. The password is NEVER stored: it comes from a getpass
 # prompt or $TARK_PASSWORD (for automation), and the JWT lives in memory for the
 # request lifetime only. Do NOT write a password to config or any file.
@@ -291,9 +303,9 @@ def _jwt_request(method: str, path: str, access: str, body: dict | None = None) 
         except Exception:
             pass
         if e.code == 401:
-            _err('JWT auth failed (401) — login expired or invalid.')
+            _err('JWT auth failed (401) - login expired or invalid.')
         elif e.code == 403:
-            _err('Permission denied (403) — your user lacks the token-management '
+            _err('Permission denied (403) - your user lacks the token-management '
                  'capability (CanDefinePAT).')
         _err(f'HTTP {e.code}: {body_text[:400]}')
     except urllib.error.URLError as e:
@@ -305,20 +317,20 @@ def _resolve_login(args) -> tuple[str, str]:
 
     Username: --user > config `user` key > interactive prompt.
     Password: $TARK_PASSWORD > getpass prompt. NEVER read from or written to any
-    file — the env var is the automation escape hatch (repo convention: secrets
+    file - the env var is the automation escape hatch (repo convention: secrets
     live in ~/.tark-secrets.env, never inlined).
     """
     username = getattr(args, 'user', None) or _load_config().get('user', '')
     if not username:
         if not sys.stdin.isatty():
-            _err('No username — pass --user, or `tark_cli config set user <name>`.')
+            _err('No username - pass --user, or `tark_cli config set user <name>`.')
         username = input('Username: ').strip()
     if not username:
         _err('Username is required for token management.')
     password = os.environ.get('TARK_PASSWORD', '')
     if not password:
         if not sys.stdin.isatty():
-            _err('No password — set $TARK_PASSWORD for non-interactive use '
+            _err('No password - set $TARK_PASSWORD for non-interactive use '
                  '(never store a password in a file).')
         password = getpass.getpass('Password: ')
     if not password:
@@ -327,7 +339,7 @@ def _resolve_login(args) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# Destructive-action guard — an explicit confirm before an irreversible call.
+# Destructive-action guard - an explicit confirm before an irreversible call.
 # `--yes` (assume_yes) bypasses for scripting; otherwise a non-'yes' reply (or
 # EOF / closed stdin) ABORTS without performing the action.
 # ---------------------------------------------------------------------------
@@ -364,7 +376,7 @@ _SCOPE_CAPABILITIES = {
 
 
 # ---------------------------------------------------------------------------
-# Safety screen — fail-closed LLM screen with a multi-provider fallback chain.
+# Safety screen - fail-closed LLM screen with a multi-provider fallback chain.
 # ---------------------------------------------------------------------------
 
 _SAFETY_PROMPT = (
@@ -407,7 +419,7 @@ def _safety_enabled(force: bool) -> bool:
 #     _provider_X(prompt, payload, timeout) -> (verdict_or_None, debug_tag)
 #
 # Return None for transient failures (timeout, quota-exhausted, empty output,
-# binary missing) — the dispatcher advances to the next provider. Return a
+# binary missing) - the dispatcher advances to the next provider. Return a
 # verbatim "SAFE" / "UNSAFE: ..." line otherwise; the dispatcher routes the
 # final verdict.
 #
@@ -417,7 +429,7 @@ def _safety_enabled(force: bool) -> bool:
 # ~/.gemini/antigravity-cli, codex ChatGPT-mode in ~/.codex/auth.json, claude
 # keychain in ~/.claude). Set SAFETY_CHECK_USE_API_KEYS=1 to pass
 # GEMINI_API_KEY / OPENAI_API_KEY / ANTHROPIC_API_KEY through (metered billing
-# — opt-in only).
+# - opt-in only).
 
 _API_KEY_VARS = ('GEMINI_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY')
 
@@ -475,7 +487,7 @@ def _gemini_quota_probe_set(stderr_text: str) -> None:
         p.parent.mkdir(parents=True, exist_ok=True)
         # Write tmp + atomic rename: POSIX guarantees rename atomicity on the
         # same filesystem, so concurrent daemon workers/CLI invocations either
-        # see the prior marker or the new one — never a partial value.
+        # see the prior marker or the new one - never a partial value.
         tmp = p.with_suffix(p.suffix + '.tmp')
         tmp.write_text(f'{until:.0f}\n')
         os.replace(tmp, p)
@@ -497,12 +509,12 @@ def _safety_subprocess_env() -> dict[str, str]:
               'NVM_DIR', 'NODE_PATH'):
         if k in os.environ:
             env[k] = os.environ[k]
-    # API-key opt-in — explicit and global.
+    # API-key opt-in - explicit and global.
     if os.environ.get('SAFETY_CHECK_USE_API_KEYS') == '1':
         for k in _API_KEY_VARS:
             if os.environ.get(k):
                 env[k] = os.environ[k]
-    # CLAUDECODE / DOT_HEADLESS are deliberately NEVER forwarded — a child
+    # CLAUDECODE / DOT_HEADLESS are deliberately NEVER forwarded - a child
     # tark_cli (or claude) seeing those would auto-on the safety screen and
     # recursively screen itself screening itself.
     return env
@@ -515,7 +527,7 @@ def _provider_gemini(prompt: str, payload: str, timeout: int) -> tuple[str | Non
     bin_ = os.environ.get('GEMINI_BIN', 'agy')
     if bin_ == 'gemini':
         # Enterprise Gemini Code Assist: legacy CLI honors -m + payload on stdin.
-        # Fast-fail on a recent terminal quota wall — the probe parses gemini-cli's
+        # Fast-fail on a recent terminal quota wall - the probe parses gemini-cli's
         # stderr format, so it is scoped to this branch (must NOT suppress agy).
         if _gemini_quota_probe_until() is not None:
             return None, 'gemini-quota-cached'
@@ -526,7 +538,7 @@ def _provider_gemini(prompt: str, payload: str, timeout: int) -> tuple[str | Non
         run_kwargs: dict = {'input': payload}
     else:
         # Antigravity CLI (`agy`): no -m (auto-selects Gemini 3.5 Flash). It is
-        # agentic, so fold prompt+payload into the -p argv — a stdin pipe or a
+        # agentic, so fold prompt+payload into the -p argv - a stdin pipe or a
         # bare instruction can tip it into search/agent mode and hang. Deliberately
         # NO --dangerously-skip-permissions: a content-safety screen must never
         # auto-approve a tool the screened text might invoke; if agy ever requests
@@ -548,7 +560,7 @@ def _provider_gemini(prompt: str, payload: str, timeout: int) -> tuple[str | Non
     # than blindly taking the last line: agy may wrap the verdict in chatter, and
     # returning chatter would fail the dispatcher CLOSED instead of advancing.
     verdict = _parse_verdict_line(proc.stdout or '')
-    # Terminal quota in stderr → arm probe + advance, but ONLY if stdout has no
+    # Terminal quota in stderr -> arm probe + advance, but ONLY if stdout has no
     # verdict (the CLI may retry quota internally and still land one). gemini-cli
     # only; agy's quota errors don't match these strings.
     if not verdict and ('QUOTA_EXHAUSTED' in err or 'exhausted your capacity' in err):
@@ -562,7 +574,7 @@ def _provider_gemini(prompt: str, payload: str, timeout: int) -> tuple[str | Non
 def _parse_verdict_line(stdout: str) -> str | None:
     # Match what the dispatcher accepts: bare 'SAFE' (any case) or 'UNSAFE:'
     # prefix (any case, colon required). The dispatcher's SAFE check is an
-    # exact-equality on .upper(), so we DON'T match 'SAFE:' here — a model
+    # exact-equality on .upper(), so we DON'T match 'SAFE:' here - a model
     # that adds annotation to the SAFE side ("SAFE: looks fine") would
     # otherwise be returned and force fail-closed at the dispatcher instead
     # of advancing to the next provider.
@@ -638,7 +650,7 @@ def _safety_check_or_die(mode: str, title: str, body: str, force: bool) -> None:
     Provider chain: tries each provider in _SAFETY_PROVIDERS in order; first
     non-empty SAFE/UNSAFE verdict wins. Transient failures (quota, timeout,
     empty output, binary missing) advance to the next provider. All providers
-    exhausted → fail-closed with stderr naming every provider tried.
+    exhausted -> fail-closed with stderr naming every provider tried.
 
     SAFE verdicts cached by SHA-256(model + mode + title + body) for 30 days
     (see _safety_cache.py). UNSAFE / unparseable / chain-exhausted never cached;
@@ -735,7 +747,7 @@ def _table(headers: list[str], rows: list[list], widths: list[int] | None = None
 
 
 def _ago(iso_str: str | None) -> str:
-    """Legacy relative-time. Strips tz before comparing to utcnow — drifts by
+    """Legacy relative-time. Strips tz before comparing to utcnow - drifts by
     local-tz offset. Kept for the 4 existing callers (last_seen / last_used /
     started timer) where the drift hasn't bitten anyone yet. New code: use
     _ago_aware which round-trips timezones correctly via fromisoformat."""
@@ -897,8 +909,8 @@ def cmd_tasks(args):
         params['assignee'] = str(user_id)
 
     if args.project:
-        # Task → BoardCard → Board → Project (task has no direct project FK).
-        # Param names must match TaskViewSet.filterset_fields exactly —
+        # Task -> BoardCard -> Board -> Project (task has no direct project FK).
+        # Param names must match TaskViewSet.filterset_fields exactly -
         # DjangoFilterBackend silently DROPS unregistered params, which made
         # these filters no-ops (C2 #5478: daemon reclaim swept unfiltered lists).
         try:
@@ -939,7 +951,7 @@ def cmd_task(args):
     """Task detail."""
     data = _get(f'/api/v1/pat/pm/tasks/{args.id}/')
 
-    # Single source of truth for the C2 web URL — downstream callers
+    # Single source of truth for the C2 web URL - downstream callers
     # (orchestrator/daemon/cli_tools/aims.py, etc.) should NOT rebuild this
     # from project_id + board + id. Keep the format here.
     if isinstance(data, dict) and data.get('id') and data.get('project_id') and data.get('board'):
@@ -963,7 +975,7 @@ def cmd_task(args):
     print(f'  Project: {data.get("project_name")}  Column: {data.get("column_name") or "-"}')
     print(f'  Priority: {data.get("priority")}  Assignee: {data.get("assignee_name") or "-"}')
 
-    # Sidecar/PM tracking fields. Always show stage + updated_at — they're the
+    # Sidecar/PM tracking fields. Always show stage + updated_at - they're the
     # cheapest "is something happening?" signal. Claim block prints only when
     # an engine is actively holding the task.
     stage = data.get('stage')
@@ -1234,7 +1246,7 @@ def _resolve_lead_pipeline(ref: str) -> int:
 
 
 def _leads_create(args):
-    """Create a lead. POST /api/v1/pat/sales/leads/ — only `title` is required."""
+    """Create a lead. POST /api/v1/pat/sales/leads/ - only `title` is required."""
     title = ' '.join(args.title) if isinstance(args.title, list) else args.title
     if not title:
         _err('leads create requires --title')
@@ -1335,7 +1347,7 @@ def cmd_offers(args):
 
 
 # ---------------------------------------------------------------------------
-# Commands: PM — projects, boards, columns, comments
+# Commands: PM - projects, boards, columns, comments
 # ---------------------------------------------------------------------------
 
 def _simple_list(path: str, label: str, headers: list, row_fn, args, params: dict | None = None):
@@ -1377,7 +1389,7 @@ def cmd_project(args):
 
 
 def cmd_board(args):
-    """PM board detail by ID. Companion to `project` — resolves board names from pinned IDs."""
+    """PM board detail by ID. Companion to `project` - resolves board names from pinned IDs."""
     data = _get(f'/api/v1/pat/pm/boards/{args.id}/')
     if args.json:
         _json_out(data)
@@ -1445,7 +1457,7 @@ def cmd_comments(args):
     data = _get(f'/api/v1/pat/pm/task-comments/{qs}')
     results = data.get('results', data) if isinstance(data, dict) else data
 
-    # Comment bodies are untrusted text — screen them before printing.
+    # Comment bodies are untrusted text - screen them before printing.
     # The TaskComment serializer field is `text`; keep `body` as a fallback for
     # any legacy/alternate shape.
     combined = '\n\n---\n\n'.join(
@@ -1501,7 +1513,7 @@ def cmd_columns_create(args):
 
 
 # ---------------------------------------------------------------------------
-# Commands: Sales — offer-lines, contracts, pipelines
+# Commands: Sales - offer-lines, contracts, pipelines
 # ---------------------------------------------------------------------------
 
 def cmd_offer_lines(args):
@@ -1547,17 +1559,17 @@ def cmd_pipeline_stages(args):
 
 
 # ---------------------------------------------------------------------------
-# Commands: Sales follow-up engine (C2 #4600) — EmailTask cadence.
+# Commands: Sales follow-up engine (C2 #4600) - EmailTask cadence.
 # A due lead becomes a DRAFT EmailTask whose body IS the verbatim email.
 # followups-check enqueues DRAFTs; email-tasks lists them; email-task-set edits a
-# draft's body/subject/status. None can cross the SEND human-gate — the server
+# draft's body/subject/status. None can cross the SEND human-gate - the server
 # blocks a PAT from setting CONFIRMED/SENT/FAILED. Need a PAT with sales:write
 # scope and a user holding sales.change_salesconfig. See sales_followup.py for the
 # gate-safe helper that writes a body and moves DRAFT -> REVIEW.
 # ---------------------------------------------------------------------------
 
 def cmd_followups_check(args):
-    """Run the due-follow-up check now — same logic as the workday schedule.
+    """Run the due-follow-up check now - same logic as the workday schedule.
 
     Creates a DRAFT EmailTask for every lead whose cadence is due (idempotent:
     leads with a pending draft are skipped).
@@ -1614,7 +1626,7 @@ def cmd_email_task_set(args):
     """Edit a draft email (`PATCH /sales/email-tasks/{id}/`).
 
     Sets the body/subject/status. The server BLOCKS CONFIRMED/SENT/FAILED over a
-    PAT — confirmation is the human gate, and SENT/FAILED belong to the sender.
+    PAT - confirmation is the human gate, and SENT/FAILED belong to the sender.
     So this can move a draft DRAFT<->REVIEW and edit its text, nothing more.
     """
     body = {}
@@ -1630,7 +1642,7 @@ def cmd_email_task_set(args):
     if getattr(args, 'to_email', None):
         body['to_email'] = args.to_email
     if not body:
-        print('  Nothing to update — pass --body/--body-file, --subject, --status, or --to-email.')
+        print('  Nothing to update - pass --body/--body-file, --subject, --status, or --to-email.')
         return
 
     data = _request('PATCH', f'/api/v1/pat/sales/email-tasks/{args.id}/', body=body)
@@ -1638,13 +1650,13 @@ def cmd_email_task_set(args):
         _json_out(data)
         return
     if isinstance(data, dict) and data.get('id'):
-        print(f'  EmailTask #{data["id"]} updated — status={data.get("status")}, subject={data.get("subject", "")!r}')
+        print(f'  EmailTask #{data["id"]} updated - status={data.get("status")}, subject={data.get("subject", "")!r}')
     else:
         _json_out(data)
 
 
 # ---------------------------------------------------------------------------
-# Commands: Clients (core — mounted at /pat/system/)
+# Commands: Clients (core - mounted at /pat/system/)
 # ---------------------------------------------------------------------------
 
 def cmd_users(args):
@@ -1715,7 +1727,7 @@ def _build_client_body(args, *, include_name: bool) -> dict:
 
 
 def cmd_clients_create(args):
-    """Create a tenant client (Company). POST /api/v1/pat/system/clients/ — needs sales:write."""
+    """Create a tenant client (Company). POST /api/v1/pat/system/clients/ - needs sales:write."""
     body = _build_client_body(args, include_name=True)
     resp = _request('POST', '/api/v1/pat/system/clients/', body=body)
     if args.json:
@@ -1725,7 +1737,7 @@ def cmd_clients_create(args):
 
 
 def cmd_clients_update(args):
-    """Update a tenant client. PATCH /api/v1/pat/system/clients/<id>/ — needs sales:write."""
+    """Update a tenant client. PATCH /api/v1/pat/system/clients/<id>/ - needs sales:write."""
     body = _build_client_body(args, include_name=False)
     if getattr(args, 'name', None) is not None:
         body['name'] = args.name
@@ -1782,9 +1794,9 @@ def cmd_ingest(args):
         if s == 'created':
             print(f'  [+] #{d.get("id")} {subj}')
         elif s == 'skipped':
-            print(f'  [=] {subj} — {d.get("reason", "exists")}')
+            print(f'  [=] {subj} - {d.get("reason", "exists")}')
         else:
-            print(f'  [!] {subj} — {d.get("reason", s)}')
+            print(f'  [!] {subj} - {d.get("reason", s)}')
     print()
 
 
@@ -1825,10 +1837,10 @@ def _recover_wiki_body(body: str) -> tuple[str, str | None, dict[str, int]]:
 
     Two corruptions are caught:
 
-    1. **JSON-quoted string** (reason=`json_quoted`) — body starts/ends with
+    1. **JSON-quoted string** (reason=`json_quoted`) - body starts/ends with
        `"` and every newline is `\\n`. `json.loads` returns the unescaped
        string.
-    2. **Naked escape** (reason=`naked_escape`) — caller stripped outer quotes
+    2. **Naked escape** (reason=`naked_escape`) - caller stripped outer quotes
        after `json.dumps`. Guard: longest line > _NAKED_ESCAPE_MIN_LINE AND
        >= _NAKED_ESCAPE_MIN_LITERAL_N literal `\\n`. Docs that discuss `\\n`
        legitimately keep short lines.
@@ -1870,7 +1882,7 @@ def _format_recovery_notice(reason: str, params: dict[str, int]) -> str:
     """Render a recovery reason tag as a human-readable stderr line.
 
     The reason+params pair is the stable contract (same as server audit_event
-    structured fields). This function is the I/O-side presentation only —
+    structured fields). This function is the I/O-side presentation only -
     if a new reason is added in `_recover_wiki_body`, add a branch here too.
     Falls back to the raw reason.
     """
@@ -1921,11 +1933,11 @@ def cmd_wiki(args):
     """Fetch / set / append / replace / put task wiki.
 
     Actions:
-        get      — fetch the markdown body (default)
-        set      — upsert: replace if section exists, else append (preferred for /brief)
-        append   — add a new `## Section` block; refuses if header already exists (use --force to override)
-        replace  — overwrite an existing section's body; 404 if header missing
-        put      — replace the WHOLE wiki body (no section). Use --body, --from-file, or --from-stdin.
+        get      - fetch the markdown body (default)
+        set      - upsert: replace if section exists, else append (preferred for /brief)
+        append   - add a new `## Section` block; refuses if header already exists (use --force to override)
+        replace  - overwrite an existing section's body; 404 if header missing
+        put      - replace the WHOLE wiki body (no section). Use --body, --from-file, or --from-stdin.
 
     Body source for any write op: --body <md> > --from-file <path> > --from-stdin.
 
@@ -1967,7 +1979,7 @@ def cmd_wiki(args):
         print(f'  wiki put OK on task #{args.task_id} ({len(wiki_out)} chars)')
         return
 
-    # Section ops below — require --section and a body source.
+    # Section ops below - require --section and a body source.
     if not args.section or body_text is None:
         _err('--section and one of --body/--from-file/--from-stdin are required for set/append/replace')
         return
@@ -1975,7 +1987,7 @@ def cmd_wiki(args):
     op = args.action
 
     # Pre-flight: GET current wiki for set/append safety checks.
-    # (replace doesn't need this — server returns 404 with detail if missing.)
+    # (replace doesn't need this - server returns 404 with detail if missing.)
     if op in ('set', 'append'):
         cur = _get(path)
         wiki_text = cur.get('wiki', '') if isinstance(cur, dict) else ''
@@ -2032,13 +2044,13 @@ def cmd_stage(args):
         return
     if isinstance(data, dict) and data.get('stage'):
         prev = data.get('previous_stage', '?')
-        print(f'  Task #{args.task_id}: {prev} → {data["stage"]}')
+        print(f'  Task #{args.task_id}: {prev} -> {data["stage"]}')
     else:
         _json_out(data)
 
 
 # ---------------------------------------------------------------------------
-# Commands: System — contract types, blocks, templates
+# Commands: System - contract types, blocks, templates
 # ---------------------------------------------------------------------------
 
 def cmd_contract_types(args):
@@ -2066,7 +2078,7 @@ def cmd_contract_templates(args):
 # ---------------------------------------------------------------------------
 
 def cmd_contract_blocks(args):
-    """List contract blocks (core/system) — sales:read."""
+    """List contract blocks (core/system) - sales:read."""
     _simple_list(
         'system/contract-blocks', 'contract blocks',
         ['ID', 'Key', 'Title', 'Category', 'System', 'Order'],
@@ -2081,7 +2093,7 @@ def cmd_contract_blocks(args):
 
 
 def cmd_sites_active(args):
-    """Active-now C2 sites (GET /c2/sites/active-now/) — c2:read.
+    """Active-now C2 sites (GET /c2/sites/active-now/) - c2:read.
 
     The endpoint 400s without a domain set, so --domains is required.
     """
@@ -2094,7 +2106,7 @@ def cmd_sites_active(args):
     if args.json:
         _json_out(data)
         return
-    print(f'\n  ACTIVE NOW — {data.get("active_users", 0)} distinct user(s), '
+    print(f'\n  ACTIVE NOW - {data.get("active_users", 0)} distinct user(s), '
           f'window {data.get("window_minutes", "?")}m\n')
     rows = [
         [domain, info.get('active_users', 0), info.get('last_event_at') or '-']
@@ -2107,7 +2119,7 @@ def cmd_sites_active(args):
 
 
 def cmd_boards_create(args):
-    """Create a PM board (POST /pm/boards/) — pm:write."""
+    """Create a PM board (POST /pm/boards/) - pm:write."""
     data = _request('POST', '/api/v1/pat/pm/boards/',
                     body={'project': args.project, 'name': args.name})
     if args.json:
@@ -2117,7 +2129,7 @@ def cmd_boards_create(args):
 
 
 def cmd_comment(args):
-    """Create a task comment (POST /pm/task-comments/) — pm:write.
+    """Create a task comment (POST /pm/task-comments/) - pm:write.
 
     The TaskComment serializer's write field is `text` (not `body`); `task` is
     the FK. `user` is set server-side from the token, so we never send it.
@@ -2132,28 +2144,28 @@ def cmd_comment(args):
 
 
 def cmd_task_delete(args):
-    """Delete a PM task (DELETE /pm/tasks/{id}/) — pm:delete. DESTRUCTIVE."""
+    """Delete a PM task (DELETE /pm/tasks/{id}/) - pm:delete. DESTRUCTIVE."""
     _confirm_destructive(f'delete task #{args.id}', getattr(args, 'yes', False))
     _request('DELETE', f'/api/v1/pat/pm/tasks/{args.id}/')
     print(f'  Deleted task #{args.id}')
 
 
 def cmd_time_delete(args):
-    """Delete a time entry (DELETE /pm/time-entries/{id}/) — pm:write. DESTRUCTIVE."""
+    """Delete a time entry (DELETE /pm/time-entries/{id}/) - pm:write. DESTRUCTIVE."""
     _confirm_destructive(f'delete time entry #{args.id}', getattr(args, 'yes', False))
     _request('DELETE', f'/api/v1/pat/pm/time-entries/{args.id}/')
     print(f'  Deleted time entry #{args.id}')
 
 
 def cmd_offer_line_delete(args):
-    """Delete an offer line (DELETE /sales/offer-lines/{id}/) — sales:write. DESTRUCTIVE."""
+    """Delete an offer line (DELETE /sales/offer-lines/{id}/) - sales:write. DESTRUCTIVE."""
     _confirm_destructive(f'delete offer line #{args.id}', getattr(args, 'yes', False))
     _request('DELETE', f'/api/v1/pat/sales/offer-lines/{args.id}/')
     print(f'  Deleted offer line #{args.id}')
 
 
 # Generic retrieve (GET /<prefix>/<id>/) for resources whose PAT registration
-# allows `retrieve` — closes the per-resource detail gap in one DRY factory.
+# allows `retrieve` - closes the per-resource detail gap in one DRY factory.
 _DETAIL_RESOURCES = {
     'column':            ('pm/board-columns', 'Board column'),
     'user':              ('system/users', 'User'),
@@ -2168,7 +2180,224 @@ _DETAIL_RESOURCES = {
     'pipeline':          ('sales/pipelines', 'Pipeline'),
     'pipeline-stage':    ('sales/pipeline-stages', 'Pipeline stage'),
     'email-task':        ('sales/email-tasks', 'Email task'),
+    'time-entry':        ('pm/time-entries', 'Time entry'),
+    'task-comment':      ('pm/task-comments', 'Task comment'),
 }
+
+
+# ---------------------------------------------------------------------------
+# Write commands (create / partial_update) for the remaining PAT actions.
+#
+# Design: each command exposes the serializer's WRITABLE fields (declared
+# `fields` minus `read_only_fields` minus SerializerMethodFields and
+# server-set audit fields) as CLI flags. create = required fields are required
+# flags; update = every flag optional and only provided flags are sent (sparse
+# PATCH, so an unset flag never clobbers server data). A field spec row is
+# (flag_dest, api_field, kind) where kind in {'s','i','f','j'} (str/int/float/
+# json). Heavy content-JSON fields (e.g. contract block_overrides) are left to
+# the `api` escape hatch, noted per command.
+# ---------------------------------------------------------------------------
+
+_WRITE_TYPE = {'i': int, 'f': float}
+
+
+def _add_write_flags(p, spec):
+    for flag, field, kind in spec:
+        kw = {'dest': flag, 'help': f'set {field}' + (' (JSON)' if kind == 'j' else '')}
+        if kind in _WRITE_TYPE:
+            kw['type'] = _WRITE_TYPE[kind]
+        p.add_argument('--' + flag.replace('_', '-'), **kw)
+
+
+def _sparse_body(args, spec):
+    """Build a body from only the flags the caller actually set (sparse PATCH)."""
+    body = {}
+    for flag, field, kind in spec:
+        val = getattr(args, flag, None)
+        if val is None:
+            continue
+        if kind == 'j':
+            try:
+                val = json.loads(val)
+            except json.JSONDecodeError as e:
+                _err(f'--{flag.replace("_", "-")} must be valid JSON: {e}')
+        body[field] = val
+    return body
+
+
+def _require_flags(args, required, cmd):
+    missing = [f for f in required if getattr(args, f, None) in (None, '')]
+    if missing:
+        _err(f'{cmd}: missing required --' + ', --'.join(m.replace('_', '-') for m in missing))
+
+
+# Field specs (writable-only). See serializer sources in tark-platform backend.
+_OFFER_FIELDS = [
+    ('title', 'title', 's'), ('client', 'client', 'i'), ('contact', 'contact', 'i'),
+    ('company_name', 'company_name', 's'), ('contact_name', 'contact_name', 's'),
+    ('contact_email', 'contact_email', 's'), ('contact_phone', 'contact_phone', 's'),
+    ('pipeline_stage', 'pipeline_stage', 'i'), ('project', 'project', 'i'),
+    ('amount', 'amount', 'f'), ('currency', 'currency', 's'), ('probability', 'probability', 'f'),
+    ('expected_close_date', 'expected_close_date', 's'), ('outcome_reason', 'outcome_reason', 'i'),
+    ('assigned_to', 'assigned_to', 'i'), ('summary', 'summary', 's'),
+    ('description', 'description', 's'), ('next_activity_at', 'next_activity_at', 's'),
+    ('next_activity_type', 'next_activity_type', 's'), ('loss_reason', 'loss_reason', 's'),
+    ('crm_meta', 'crm_meta', 'j'),
+]
+_OFFERLINE_FIELDS = [
+    ('offer', 'offer', 'i'), ('product', 'product', 'i'), ('description', 'description', 's'),
+    ('quantity', 'quantity', 'f'), ('unit_price', 'unit_price', 'f'),
+    ('discount', 'discount', 'f'), ('order', 'order', 'i'),
+]
+_LEAD_FIELDS = [
+    ('title', 'title', 's'), ('company_name', 'company_name', 's'), ('person_name', 'person_name', 's'),
+    ('email', 'email', 's'), ('phone', 'phone', 's'), ('source', 'source', 's'),
+    ('status', 'status', 's'), ('pipeline', 'pipeline', 'i'), ('pipeline_stage', 'pipeline_stage', 'i'),
+    ('assigned_to', 'assigned_to', 'i'), ('notes', 'notes', 's'), ('client', 'client', 'i'),
+    ('contact', 'contact', 'i'), ('crm_meta', 'crm_meta', 'j'),
+]
+_CONTRACT_FIELDS = [
+    ('title', 'title', 's'), ('client', 'client', 'i'), ('template', 'template', 'i'),
+    ('pipeline_stage', 'pipeline_stage', 'i'), ('status', 'status', 's'),
+    ('language', 'language', 's'), ('offer', 'offer', 'i'), ('contact', 'contact', 'i'),
+    ('project', 'project', 'i'),
+]
+_TIMEENTRY_FIELDS = [
+    ('task', 'task', 'i'), ('user', 'user', 'i'), ('date', 'date', 's'),
+    ('hours', 'hours', 'f'), ('description', 'description', 's'),
+]
+_EMAILTASK_FIELDS = [
+    ('lead', 'lead', 'i'), ('to_email', 'to_email', 's'), ('template', 'template', 'i'),
+    ('subject', 'subject', 's'), ('body', 'body', 's'), ('send_at', 'send_at', 's'),
+    ('status', 'status', 's'),
+]
+
+
+def cmd_offers_create(args):
+    """Create a sales offer (POST /sales/offers/) - sales:write."""
+    _require_flags(args, ['title'], 'offers-create')
+    data = _request('POST', '/api/v1/pat/sales/offers/', body=_sparse_body(args, _OFFER_FIELDS))
+    if args.json:
+        _json_out(data)
+        return
+    print(f"  Created offer #{data.get('id')}: {data.get('title', '')}")
+
+
+def cmd_offers_update(args):
+    """Update a sales offer (PATCH /sales/offers/{id}/, sparse) - sales:write."""
+    body = _sparse_body(args, _OFFER_FIELDS)
+    if not body:
+        _err('offers-update: no fields to update (pass at least one flag).')
+    data = _request('PATCH', f'/api/v1/pat/sales/offers/{args.id}/', body=body)
+    if args.json:
+        _json_out(data)
+        return
+    print(f"  Updated offer #{args.id}: {', '.join(body)}")
+
+
+def cmd_offer_lines_create(args):
+    """Create an offer line (POST /sales/offer-lines/) - sales:write."""
+    _require_flags(args, ['offer', 'description'], 'offer-lines-create')
+    data = _request('POST', '/api/v1/pat/sales/offer-lines/', body=_sparse_body(args, _OFFERLINE_FIELDS))
+    if args.json:
+        _json_out(data)
+        return
+    print(f"  Created offer line #{data.get('id')} on offer #{args.offer}")
+
+
+def cmd_offer_lines_update(args):
+    """Update an offer line (PATCH /sales/offer-lines/{id}/, sparse) - sales:write."""
+    body = _sparse_body(args, _OFFERLINE_FIELDS)
+    if not body:
+        _err('offer-lines-update: no fields to update (pass at least one flag).')
+    data = _request('PATCH', f'/api/v1/pat/sales/offer-lines/{args.id}/', body=body)
+    if args.json:
+        _json_out(data)
+        return
+    print(f"  Updated offer line #{args.id}: {', '.join(body)}")
+
+
+def cmd_contracts_create(args):
+    """Create a sales contract (POST /sales/contracts/) - sales:write.
+
+    Exposes the stable scalar/FK writable fields. Heavy content-JSON fields
+    (block_overrides, selected_pricing, custom_fields, ...) go via `api --post`.
+    """
+    data = _request('POST', '/api/v1/pat/sales/contracts/', body=_sparse_body(args, _CONTRACT_FIELDS))
+    if args.json:
+        _json_out(data)
+        return
+    print(f"  Created contract #{data.get('id')}: {data.get('title', '')}")
+
+
+def cmd_contracts_update(args):
+    """Update a sales contract (PATCH /sales/contracts/{id}/, sparse) - sales:write."""
+    body = _sparse_body(args, _CONTRACT_FIELDS)
+    if not body:
+        _err('contracts-update: no fields to update (pass at least one flag).')
+    data = _request('PATCH', f'/api/v1/pat/sales/contracts/{args.id}/', body=body)
+    if args.json:
+        _json_out(data)
+        return
+    print(f"  Updated contract #{args.id}: {', '.join(body)}")
+
+
+def cmd_leads_update(args):
+    """Update a lead (PATCH /sales/leads/{id}/, sparse) - sales:write."""
+    body = _sparse_body(args, _LEAD_FIELDS)
+    if not body:
+        _err('leads-update: no fields to update (pass at least one flag).')
+    data = _request('PATCH', f'/api/v1/pat/sales/leads/{args.id}/', body=body)
+    if args.json:
+        _json_out(data)
+        return
+    print(f"  Updated lead #{args.id}: {', '.join(body)}")
+
+
+def cmd_time_update(args):
+    """Update a time entry (PATCH /pm/time-entries/{id}/, sparse) - pm:write."""
+    body = _sparse_body(args, _TIMEENTRY_FIELDS)
+    if not body:
+        _err('time-update: no fields to update (pass at least one flag).')
+    data = _request('PATCH', f'/api/v1/pat/pm/time-entries/{args.id}/', body=body)
+    if args.json:
+        _json_out(data)
+        return
+    print(f"  Updated time entry #{args.id}: {', '.join(body)}")
+
+
+def cmd_email_tasks_create(args):
+    """Create a DRAFT sales email (POST /sales/email-tasks/) - sales:write.
+
+    No confirm/send: the server blocks a PAT from setting CONFIRMED/SENT/FAILED
+    (human gate), so this can only draft. `--status` reaches DRAFT/REVIEW only.
+    """
+    _require_flags(args, ['lead'], 'email-tasks-create')
+    data = _request('POST', '/api/v1/pat/sales/email-tasks/', body=_sparse_body(args, _EMAILTASK_FIELDS))
+    if args.json:
+        _json_out(data)
+        return
+    print(f"  Created email task #{data.get('id')} (status={data.get('status', '')}) for lead #{args.lead}")
+
+
+def cmd_leads_ingest(args):
+    """Batch-create leads (POST /sales/leads/ingest/, dedupes by title) - sales:write."""
+    _require_flags(args, ['pipeline'], 'leads-ingest')
+    if getattr(args, 'leads_file', None):
+        with open(args.leads_file) as f:
+            leads = json.load(f)
+    elif getattr(args, 'leads', None):
+        try:
+            leads = json.loads(args.leads)
+        except json.JSONDecodeError as e:
+            _err(f'--leads must be a JSON array: {e}')
+    else:
+        _err('leads-ingest: pass --leads <json-array> or --leads-file <path>.')
+    body = {'pipeline': args.pipeline, 'leads': leads}
+    if getattr(args, 'source_loop', None):
+        body['source_loop'] = args.source_loop
+    data = _request('POST', '/api/v1/pat/sales/leads/ingest/', body=body)
+    _json_out(data) if args.json else print(f'  Lead ingest: {json.dumps(data)[:300]}')
 
 
 def _make_detail_cmd(prefix: str, label: str):
@@ -2195,7 +2424,7 @@ def _make_detail_cmd(prefix: str, label: str):
 
 
 # ---------------------------------------------------------------------------
-# Commands: Generic — `api` escape hatch for any PAT endpoint
+# Commands: Generic - `api` escape hatch for any PAT endpoint
 # ---------------------------------------------------------------------------
 
 def cmd_api(args):
@@ -2237,8 +2466,8 @@ def cmd_api(args):
 def cmd_tokens(args):
     """PAT management via web login (JWT). Actions: list (default), scopes, create, revoke.
 
-    The /pat/tokens/ endpoints reject PAT auth by design — a token must never be
-    able to mint or revoke tokens — so these mirror the C2 web UI and
+    The /pat/tokens/ endpoints reject PAT auth by design - a token must never be
+    able to mint or revoke tokens - so these mirror the C2 web UI and
     authenticate with a short-lived password login (see _resolve_login /
     _jwt_login). `scopes` also works offline via the static capability map.
     """
@@ -2299,7 +2528,7 @@ def _tokens_scopes(args):
         })
         return
 
-    print('\n  PAT SCOPES — what each scope unlocks\n')
+    print('\n  PAT SCOPES - what each scope unlocks\n')
     rows = [
         [scope, ('-' if live is None else ('yes' if scope in live else 'no')),
          _SCOPE_CAPABILITIES[scope]]
@@ -2307,7 +2536,7 @@ def _tokens_scopes(args):
     ]
     _table(['Scope', 'On deploy', 'Enables'], rows)
     if live is None:
-        print('\n  (static map — set --user + $TARK_PASSWORD to also show '
+        print('\n  (static map - set --user + $TARK_PASSWORD to also show '
               'deployment-available scopes)')
     print()
 
@@ -2496,7 +2725,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--limit', type=int, help='Max rows to display')
 
     # leads [list|create]
-    p = sub.add_parser('leads', help='Sales leads — browse, or `create`')
+    p = sub.add_parser('leads', help='Sales leads - browse, or `create`')
     p.add_argument('action', nargs='?', choices=['list', 'create'], help='Default: list. `create` opens a new lead (needs sales:write PAT).')
     p.add_argument('--pipeline', help='list: filter by pipeline name. create: target lead pipeline (name or ID, e.g. Imports)')
     p.add_argument('--status', help='list: filter by status. create: initial status (NEW|CONTACTED|QUALIFIED|DISQUALIFIED)')
@@ -2531,15 +2760,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--pipeline', help='Filter by pipeline ID')
 
     # followups-check (follow-up engine)
-    sub.add_parser('followups-check', help='Run the due-follow-up check now — creates DRAFT EmailTasks for due leads')
+    sub.add_parser('followups-check', help='Run the due-follow-up check now - creates DRAFT EmailTasks for due leads')
 
-    # email-tasks (follow-up engine — list scheduled sales emails)
+    # email-tasks (follow-up engine - list scheduled sales emails)
     p = sub.add_parser('email-tasks', help='List scheduled sales emails (the follow-up engine)')
     p.add_argument('-f', '--status', help='Filter by status (DRAFT, REVIEW, CONFIRMED, SENT, FAILED, CANCELLED)')
     p.add_argument('--lead', help='Filter by lead ID')
     p.add_argument('--limit', type=int, help='Max rows')
 
-    # email-task-set (edit a draft email — never confirms/sends)
+    # email-task-set (edit a draft email - never confirms/sends)
     p = sub.add_parser('email-task-set', help='Edit a draft email body/subject/status (server blocks CONFIRMED/SENT/FAILED)')
     p.add_argument('id', help='EmailTask ID')
     p.add_argument('--body', help='Email body (the verbatim email)')
@@ -2551,7 +2780,7 @@ def build_parser() -> argparse.ArgumentParser:
     # projects
     sub.add_parser('projects', help='PM projects')
 
-    # projects-update — needs pm:write + backend `partial_update` registration in pat_urls.py
+    # projects-update - needs pm:write + backend `partial_update` registration in pat_urls.py
     p = sub.add_parser('projects-update', help='PATCH a PM project (needs pm:write + backend partial_update)')
     p.add_argument('id', type=int, help='Project ID')
     p.add_argument('--name', help='Project name')
@@ -2562,7 +2791,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--end-date', dest='end_date', help='End date (YYYY-MM-DD)')
     p.add_argument('--client', type=int, help='Client ID')
 
-    # project <id> — detail
+    # project <id> - detail
     p = sub.add_parser('project', help='PM project detail (by ID)')
     p.add_argument('id', type=int, help='Project ID')
 
@@ -2570,7 +2799,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser('boards', help='PM boards')
     p.add_argument('--project', help='Filter by project ID')
 
-    # board <id> — detail
+    # board <id> - detail
     p = sub.add_parser('board', help='PM board detail (by ID)')
     p.add_argument('id', type=int, help='Board ID')
 
@@ -2599,28 +2828,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--search', '-s', help='Search by name or address')
     p.add_argument('--limit', type=int, help='Max results')
 
-    # clients-create — needs sales:write
-    p = sub.add_parser('clients-create', help='Create a tenant client (Company) — needs sales:write')
+    # clients-create - needs sales:write
+    p = sub.add_parser('clients-create', help='Create a tenant client (Company) - needs sales:write')
     p.add_argument('name', help='Company name (required)')
     p.add_argument('--registry-code', dest='registry_code', help='Registry code (e.g. 11483740)')
     p.add_argument('--email', help='Primary contact email')
     p.add_argument('--address', help='Address')
     p.add_argument('--contact-info', dest='contact_info', help='Free-form contact info')
-    p.add_argument('--contact', type=int, help='Contact (User) ID — must belong to your tenant')
+    p.add_argument('--contact', type=int, help='Contact (User) ID - must belong to your tenant')
     p.add_argument('--representative-name', dest='representative_name', help='Legal representative name')
     p.add_argument('--representative-basis', dest='representative_basis', help='Representative legal basis')
     p.add_argument('--billing-info', dest='billing_info', help='Billing details')
     p.add_argument('--notes', help='Notes')
 
-    # clients-update — needs sales:write
-    p = sub.add_parser('clients-update', help='Update a tenant client (PATCH) — needs sales:write')
+    # clients-update - needs sales:write
+    p = sub.add_parser('clients-update', help='Update a tenant client (PATCH) - needs sales:write')
     p.add_argument('id', type=int, help='Client ID')
     p.add_argument('--name', help='Company name')
     p.add_argument('--registry-code', dest='registry_code', help='Registry code')
     p.add_argument('--email', help='Primary contact email')
     p.add_argument('--address', help='Address')
     p.add_argument('--contact-info', dest='contact_info', help='Free-form contact info')
-    p.add_argument('--contact', type=int, help='Contact (User) ID — must belong to your tenant')
+    p.add_argument('--contact', type=int, help='Contact (User) ID - must belong to your tenant')
     p.add_argument('--representative-name', dest='representative_name', help='Legal representative name')
     p.add_argument('--representative-basis', dest='representative_basis', help='Representative legal basis')
     p.add_argument('--billing-info', dest='billing_info', help='Billing details')
@@ -2653,7 +2882,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('task_id', type=int, help='Task ID')
     p.add_argument('--priority', choices=['low', 'medium', 'high', 'urgent'], help='Task priority')
     p.add_argument('--column', type=int, help='Board column ID')
-    p.add_argument('--assignee', type=int, help='Assignee user ID (use 0 to unassign — server may reject; prefer api --patch \'{"assignee":null}\')')
+    p.add_argument('--assignee', type=int, help='Assignee user ID (use 0 to unassign - server may reject; prefer api --patch \'{"assignee":null}\')')
     p.add_argument('--name', help='Task name/subject')
     p.add_argument('--description', help='Task description')
     p.add_argument('--estimate-hours', dest='estimate_hours', type=float, help='Estimated hours')
@@ -2667,7 +2896,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser('contract-templates', help='Contract templates (system)')
     sub.add_parser('contract-blocks', help='Contract blocks (system)')
 
-    # sites-active (c2:read) — requires --domains
+    # sites-active (c2:read) - requires --domains
     p = sub.add_parser('sites-active', help='C2 sites active-now (needs --domains)')
     p.add_argument('--domains', required=True, help='Comma-separated domains, e.g. a.tt.ee,b.tt.ee')
     p.add_argument('--window', help='Activity window, e.g. 15m, 1h (default 15m)')
@@ -2677,7 +2906,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('project', type=int, help='Project ID')
     p.add_argument('name', help='Board name')
 
-    # comment <task_id> <body> (pm:write) — create a task comment
+    # comment <task_id> <body> (pm:write) - create a task comment
     p = sub.add_parser('comment', help='Add a comment to a task')
     p.add_argument('task_id', type=int, help='Task ID')
     p.add_argument('body', nargs='+', help='Comment body')
@@ -2697,6 +2926,49 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('id', type=int, help='Offer line ID')
     p.add_argument('--yes', '-y', action='store_true', help='Skip the confirmation prompt (for scripts)')
 
+    # --- create/update write commands (sparse PATCH for updates) ---
+    # sales offers
+    p = sub.add_parser('offers-create', help='Create a sales offer (needs sales:write)')
+    _add_write_flags(p, _OFFER_FIELDS)  # --title required (enforced in handler)
+    p = sub.add_parser('offers-update', help='Update a sales offer (sparse PATCH)')
+    p.add_argument('id', type=int, help='Offer ID')
+    _add_write_flags(p, _OFFER_FIELDS)
+
+    # sales offer-lines
+    p = sub.add_parser('offer-lines-create', help='Create an offer line (needs sales:write)')
+    _add_write_flags(p, _OFFERLINE_FIELDS)  # --offer, --description required
+    p = sub.add_parser('offer-lines-update', help='Update an offer line (sparse PATCH)')
+    p.add_argument('id', type=int, help='Offer line ID')
+    _add_write_flags(p, _OFFERLINE_FIELDS)
+
+    # sales contracts
+    p = sub.add_parser('contracts-create', help='Create a sales contract (scalar/FK fields; content-JSON via `api`)')
+    _add_write_flags(p, _CONTRACT_FIELDS)
+    p = sub.add_parser('contracts-update', help='Update a sales contract (sparse PATCH)')
+    p.add_argument('id', type=int, help='Contract ID')
+    _add_write_flags(p, _CONTRACT_FIELDS)
+
+    # sales leads update (create is `leads create`; batch is `leads-ingest`)
+    p = sub.add_parser('leads-update', help='Update a lead (sparse PATCH)')
+    p.add_argument('id', type=int, help='Lead ID')
+    _add_write_flags(p, _LEAD_FIELDS)
+
+    # sales leads batch ingest
+    p = sub.add_parser('leads-ingest', help='Batch-create leads (dedupes by title)')
+    p.add_argument('--pipeline', help='Pipeline name or ID (required)')
+    p.add_argument('--leads', help='Leads as a JSON array string')
+    p.add_argument('--leads-file', dest='leads_file', help='Path to a JSON file with the leads array')
+    p.add_argument('--source-loop', dest='source_loop', help='Provenance tag for the batch')
+
+    # sales email-tasks create (edit is `email-task-set`; NO confirm/send flag)
+    p = sub.add_parser('email-tasks-create', help='Create a DRAFT sales email (never confirms/sends)')
+    _add_write_flags(p, _EMAILTASK_FIELDS)  # --lead required
+
+    # pm time-entries update (create is `log`, delete is `time-delete`)
+    p = sub.add_parser('time-update', help='Update a time entry (sparse PATCH)')
+    p.add_argument('id', type=int, help='Time entry ID')
+    _add_write_flags(p, _TIMEENTRY_FIELDS)
+
     # detail retrieve commands (one per PAT resource that allows `retrieve`)
     for _dname, (_dprefix, _dlabel) in _DETAIL_RESOURCES.items():
         _dp = sub.add_parser(_dname, help=f'{_dlabel} detail (by ID)')
@@ -2709,7 +2981,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--post', help='POST body (JSON string)')
     p.add_argument('--patch', help='PATCH body (JSON string). Use path like "pm/tasks/123"')
 
-    # tokens [list|scopes|create|revoke] — management via web login (JWT)
+    # tokens [list|scopes|create|revoke] - management via web login (JWT)
     p = sub.add_parser('tokens', help='PAT management via web login (list/scopes/create/revoke)')
     p.add_argument('action', nargs='?', choices=['list', 'scopes', 'create', 'revoke'],
                    default='list', help='Default: list. Also scopes|create|revoke.')
@@ -2776,6 +3048,16 @@ COMMANDS = {
     'task-delete': cmd_task_delete,
     'time-delete': cmd_time_delete,
     'offer-line-delete': cmd_offer_line_delete,
+    'offers-create': cmd_offers_create,
+    'offers-update': cmd_offers_update,
+    'offer-lines-create': cmd_offer_lines_create,
+    'offer-lines-update': cmd_offer_lines_update,
+    'contracts-create': cmd_contracts_create,
+    'contracts-update': cmd_contracts_update,
+    'leads-update': cmd_leads_update,
+    'leads-ingest': cmd_leads_ingest,
+    'email-tasks-create': cmd_email_tasks_create,
+    'time-update': cmd_time_update,
     'clients': cmd_clients,
     'clients-create': cmd_clients_create,
     'clients-update': cmd_clients_update,
@@ -2786,7 +3068,7 @@ COMMANDS = {
     'api': cmd_api,
     'tokens': cmd_tokens,
     'config': cmd_config,
-    # Detail (retrieve) commands — one per PAT resource that allows `retrieve`.
+    # Detail (retrieve) commands - one per PAT resource that allows `retrieve`.
     **{_n: _make_detail_cmd(_p, _l) for _n, (_p, _l) in _DETAIL_RESOURCES.items()},
 }
 
