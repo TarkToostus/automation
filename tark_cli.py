@@ -342,8 +342,8 @@ def _confirm_destructive(action_desc: str, assume_yes: bool) -> None:
         reply = sys.stdin.readline().strip().lower()
     except (EOFError, KeyboardInterrupt, ValueError):
         reply = ''
-    if reply not in ('yes', 'y'):
-        _err('Aborted — confirmation not given.')
+    if reply != 'yes':
+        _err('Aborted - confirmation not given.')
 
 
 # ---------------------------------------------------------------------------
