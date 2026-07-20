@@ -23,8 +23,13 @@ Usage (binary installed as `tark_cli` at ~/bin/tark_cli; examples below use that
     tark_cli project <id>                       # PM project detail
     tark_cli boards [--project=X]               # List boards
     tark_cli board <id>                         # PM board detail
+    tark_cli boards-create <project_id> <name>  # Create a board (pm:write)
     tark_cli columns [--board=X]                # List board-columns
+    tark_cli column <id>                        # Board-column detail
     tark_cli comments [--task=X]                # List task comments
+    tark_cli comment <task-id> <body>           # Add a task comment (pm:write)
+    tark_cli task-delete <id> [--yes]           # Delete a task (pm:delete, DESTRUCTIVE)
+    tark_cli time-delete <id> [--yes]           # Delete a time entry (pm:write, DESTRUCTIVE)
 
     tark_cli timer                          # Active timer
     tark_cli start <task-id>                # Start timer
@@ -38,12 +43,19 @@ Usage (binary installed as `tark_cli` at ~/bin/tark_cli; examples below use that
     tark_cli leads create --title "..." [--company X] [--pipeline Imports] [--source COLD]  # Create a lead
     tark_cli offers                         # Sales offers
     tark_cli offer-lines [--offer=X]        # Offer line items
+    tark_cli offer-line-delete <id> [--yes] # Delete an offer line (sales:write, DESTRUCTIVE)
     tark_cli contracts                      # Sales contracts
     tark_cli pipelines                      # CRM pipelines
     tark_cli pipeline-stages [--pipeline=X] # Pipeline stages
     tark_cli contract-types                 # Contract types (system)
     tark_cli contract-templates             # Contract templates (system)
+    tark_cli contract-blocks                # Contract blocks (system)
+    tark_cli sites-active --domains a,b     # C2 sites active-now (c2:read)
     tark_cli clients [--search=X]           # Tenant clients
+
+    # Detail (retrieve) by ID — one per PAT resource that allows retrieve:
+    tark_cli {lead|offer|offer-line|contract|pipeline|pipeline-stage|email-task} <id>
+    tark_cli {client|user|contract-type|contract-block|contract-template|column} <id>
     tark_cli ingest <project> <board> --tasks '[{"subject":"..."}]'   # Batch ingest PM tasks
     tark_cli wiki <task-id>                              # Fetch task wiki
     tark_cli wiki <task-id> set     --section <h> --body <md>  # Upsert (preferred)
@@ -54,7 +66,10 @@ Usage (binary installed as `tark_cli` at ~/bin/tark_cli; examples below use that
     tark_cli wiki <task-id> put     --from-stdin               # Same, body read from stdin
     tark_cli stage <task-id> <stage>        # Advance task stage (gates on wiki)
     tark_cli update <task-id> [--priority X] [--column Y] [--assignee Z] [--name ...]  # Patch task fields
-    tark_cli tokens                         # List PATs
+    tark_cli tokens                         # List PATs (web login / JWT)
+    tark_cli tokens scopes                  # Scope -> capability map (+ live-available)
+    tark_cli tokens create --name X --scope pm:write [--scope ...] [--expires YYYY-MM-DD]  # Mint a PAT (shown once)
+    tark_cli tokens revoke <id> [--yes]     # Revoke a PAT (DESTRUCTIVE)
 
     tark_cli api <path> [--filter k=v ...]  # Generic GET for any /pat/<path>/
     tark_cli api <path> --post <json>       # Generic POST
@@ -69,6 +84,7 @@ Auth: C2_PAT env var, or ~/.config/tark/config.json
 """
 
 import argparse
+import getpass
 import json
 import os
 import re
@@ -213,6 +229,138 @@ def _post(path: str, body: dict | None = None) -> dict | list:
 
 def _put(path: str, body: dict | None = None) -> dict | list:
     return _request('PUT', path, body=body)
+
+
+# ---------------------------------------------------------------------------
+# JWT web-login auth — token management ONLY.
+#
+# The /api/v1/pat/tokens/ endpoints reject PAT auth by design: a token must never
+# be able to mint or revoke tokens (privilege escalation). So token management
+# mirrors the C2 web UI — obtain a short-lived JWT via password login and use it
+# for that one request. The password is NEVER stored: it comes from a getpass
+# prompt or $TARK_PASSWORD (for automation), and the JWT lives in memory for the
+# request lifetime only. Do NOT write a password to config or any file.
+# ---------------------------------------------------------------------------
+
+def _jwt_login(username: str, password: str) -> str:
+    """POST /api/v1/auth/ (SimpleJWT PasswordTokenObtainPairView) -> access JWT."""
+    base = _get_url().rstrip('/')
+    data = json.dumps({'username': username, 'password': password}).encode()
+    req = urllib.request.Request(
+        f'{base}/api/v1/auth/', data=data,
+        headers={'Content-Type': 'application/json', 'Accept': 'application/json'},
+        method='POST',
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            payload = json.loads(resp.read().decode() or '{}')
+    except urllib.error.HTTPError as e:
+        if e.code in (400, 401):
+            _err('Login failed (bad username or password).')
+        _err(f'Login failed: HTTP {e.code}')
+    except urllib.error.URLError as e:
+        _err(f'Login connection failed: {e.reason}')
+    access = payload.get('access') if isinstance(payload, dict) else None
+    if not access:
+        _err('Login succeeded but returned no access token.')
+    return access
+
+
+def _jwt_request(method: str, path: str, access: str, body: dict | None = None) -> dict | list:
+    """Authenticated request with a web-login JWT (not a PAT). Used only for the
+    /pat/tokens/ management endpoints, which reject PAT auth."""
+    base = _get_url().rstrip('/')
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        f'{base}{path}', data=data,
+        headers={
+            'Authorization': f'Bearer {access}',
+            'Content-Type': 'application/json',
+            'Accept': 'application/json',
+        },
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = resp.read().decode()
+            return json.loads(raw) if raw.strip() else {}
+    except urllib.error.HTTPError as e:
+        body_text = ''
+        try:
+            body_text = e.read().decode()
+        except Exception:
+            pass
+        if e.code == 401:
+            _err('JWT auth failed (401) — login expired or invalid.')
+        elif e.code == 403:
+            _err('Permission denied (403) — your user lacks the token-management '
+                 'capability (CanDefinePAT).')
+        _err(f'HTTP {e.code}: {body_text[:400]}')
+    except urllib.error.URLError as e:
+        _err(f'Connection failed: {e.reason}')
+
+
+def _resolve_login(args) -> tuple[str, str]:
+    """Return (username, password) for web login.
+
+    Username: --user > config `user` key > interactive prompt.
+    Password: $TARK_PASSWORD > getpass prompt. NEVER read from or written to any
+    file — the env var is the automation escape hatch (repo convention: secrets
+    live in ~/.tark-secrets.env, never inlined).
+    """
+    username = getattr(args, 'user', None) or _load_config().get('user', '')
+    if not username:
+        if not sys.stdin.isatty():
+            _err('No username — pass --user, or `tark_cli config set user <name>`.')
+        username = input('Username: ').strip()
+    if not username:
+        _err('Username is required for token management.')
+    password = os.environ.get('TARK_PASSWORD', '')
+    if not password:
+        if not sys.stdin.isatty():
+            _err('No password — set $TARK_PASSWORD for non-interactive use '
+                 '(never store a password in a file).')
+        password = getpass.getpass('Password: ')
+    if not password:
+        _err('Password is required for token management.')
+    return username, password
+
+
+# ---------------------------------------------------------------------------
+# Destructive-action guard — an explicit confirm before an irreversible call.
+# `--yes` (assume_yes) bypasses for scripting; otherwise a non-'yes' reply (or
+# EOF / closed stdin) ABORTS without performing the action.
+# ---------------------------------------------------------------------------
+
+def _confirm_destructive(action_desc: str, assume_yes: bool) -> None:
+    if assume_yes:
+        return
+    sys.stderr.write(f'About to {action_desc}. This cannot be undone.\n')
+    sys.stderr.write("Type 'yes' to confirm (or pass --yes): ")
+    sys.stderr.flush()
+    try:
+        reply = sys.stdin.readline().strip().lower()
+    except (EOFError, KeyboardInterrupt, ValueError):
+        reply = ''
+    if reply not in ('yes', 'y'):
+        _err('Aborted — confirmation not given.')
+
+
+# ---------------------------------------------------------------------------
+# Static scope -> capability map. Derived from the four backend pat_urls.py
+# files; documents "what the PAT enables" offline and is the fallback for
+# `tokens scopes` when no login credentials are available.
+# ---------------------------------------------------------------------------
+
+_SCOPE_CAPABILITIES = {
+    'c2:read':     'Read C2 deployments + sites active-now',
+    'pm:read':     'Read PM projects, boards, columns, tasks, comments, time entries',
+    'pm:write':    'Create/update PM tasks, comments, boards, columns, projects, timers, time entries',
+    'pm:delete':   'Delete PM tasks',
+    'sales:read':  'Read leads, pipelines, pipeline stages, contract types/blocks/templates',
+    'sales:write': 'Create/update leads, offers, offer-lines, contracts, clients, email drafts',
+    'users:read':  'Read the tenant user roster',
+}
 
 
 # ---------------------------------------------------------------------------
@@ -1298,8 +1446,10 @@ def cmd_comments(args):
     results = data.get('results', data) if isinstance(data, dict) else data
 
     # Comment bodies are untrusted text — screen them before printing.
+    # The TaskComment serializer field is `text`; keep `body` as a fallback for
+    # any legacy/alternate shape.
     combined = '\n\n---\n\n'.join(
-        (c.get('body') or '') for c in results if isinstance(c, dict)
+        (c.get('text') or c.get('body') or '') for c in results if isinstance(c, dict)
     )
     _safety_check_or_die(
         'comment',
@@ -1315,11 +1465,11 @@ def cmd_comments(args):
     print(f'\n  TASK COMMENTS ({len(results)})\n')
     rows = [[
         c.get('id'), c.get('task'),
-        c.get('author_name') or c.get('author', ''),
+        c.get('user_name') or c.get('author_name') or c.get('user') or c.get('author', ''),
         (c.get('created_at') or '')[:10],
-        (c.get('body') or '')[:60],
+        (c.get('text') or c.get('body') or '')[:60],
     ] for c in results]
-    _table(['ID', 'Task', 'Author', 'Created', 'Body'], rows)
+    _table(['ID', 'Task', 'Author', 'Created', 'Text'], rows)
     print()
 
 
@@ -1912,6 +2062,139 @@ def cmd_contract_templates(args):
 
 
 # ---------------------------------------------------------------------------
+# Commands: additional PAT capabilities (keep the pat_urls.py invariant whole)
+# ---------------------------------------------------------------------------
+
+def cmd_contract_blocks(args):
+    """List contract blocks (core/system) — sales:read."""
+    _simple_list(
+        'system/contract-blocks', 'contract blocks',
+        ['ID', 'Key', 'Title', 'Category', 'System', 'Order'],
+        lambda b: [
+            b.get('id'), b.get('key', ''),
+            (b.get('title_en') or b.get('title_et') or '')[:40],
+            b.get('category', ''), 'yes' if b.get('is_system') else '',
+            b.get('sort_order', ''),
+        ],
+        args,
+    )
+
+
+def cmd_sites_active(args):
+    """Active-now C2 sites (GET /c2/sites/active-now/) — c2:read.
+
+    The endpoint 400s without a domain set, so --domains is required.
+    """
+    if not getattr(args, 'domains', None):
+        _err('--domains is required (comma-separated, e.g. --domains a.tt.ee,b.tt.ee).')
+    params = {'domains': args.domains}
+    if getattr(args, 'window', None):
+        params['window'] = args.window
+    data = _get('/api/v1/pat/c2/sites/active-now/', **params)
+    if args.json:
+        _json_out(data)
+        return
+    print(f'\n  ACTIVE NOW — {data.get("active_users", 0)} distinct user(s), '
+          f'window {data.get("window_minutes", "?")}m\n')
+    rows = [
+        [domain, info.get('active_users', 0), info.get('last_event_at') or '-']
+        for domain, info in (data.get('per_domain') or {}).items()
+    ]
+    _table(['Domain', 'Active', 'Last event'], rows)
+    if data.get('missing_domains'):
+        print(f'\n  Not tracked in C2: {", ".join(data["missing_domains"])}')
+    print()
+
+
+def cmd_boards_create(args):
+    """Create a PM board (POST /pm/boards/) — pm:write."""
+    data = _request('POST', '/api/v1/pat/pm/boards/',
+                    body={'project': args.project, 'name': args.name})
+    if args.json:
+        _json_out(data)
+        return
+    print(f"  Created board #{data.get('id')}: {data.get('name', '')} (project={args.project})")
+
+
+def cmd_comment(args):
+    """Create a task comment (POST /pm/task-comments/) — pm:write.
+
+    The TaskComment serializer's write field is `text` (not `body`); `task` is
+    the FK. `user` is set server-side from the token, so we never send it.
+    """
+    text = ' '.join(args.body) if isinstance(args.body, list) else args.body
+    data = _request('POST', '/api/v1/pat/pm/task-comments/',
+                    body={'task': args.task_id, 'text': text})
+    if args.json:
+        _json_out(data)
+        return
+    print(f"  Added comment #{data.get('id')} on task #{args.task_id}")
+
+
+def cmd_task_delete(args):
+    """Delete a PM task (DELETE /pm/tasks/{id}/) — pm:delete. DESTRUCTIVE."""
+    _confirm_destructive(f'delete task #{args.id}', getattr(args, 'yes', False))
+    _request('DELETE', f'/api/v1/pat/pm/tasks/{args.id}/')
+    print(f'  Deleted task #{args.id}')
+
+
+def cmd_time_delete(args):
+    """Delete a time entry (DELETE /pm/time-entries/{id}/) — pm:write. DESTRUCTIVE."""
+    _confirm_destructive(f'delete time entry #{args.id}', getattr(args, 'yes', False))
+    _request('DELETE', f'/api/v1/pat/pm/time-entries/{args.id}/')
+    print(f'  Deleted time entry #{args.id}')
+
+
+def cmd_offer_line_delete(args):
+    """Delete an offer line (DELETE /sales/offer-lines/{id}/) — sales:write. DESTRUCTIVE."""
+    _confirm_destructive(f'delete offer line #{args.id}', getattr(args, 'yes', False))
+    _request('DELETE', f'/api/v1/pat/sales/offer-lines/{args.id}/')
+    print(f'  Deleted offer line #{args.id}')
+
+
+# Generic retrieve (GET /<prefix>/<id>/) for resources whose PAT registration
+# allows `retrieve` — closes the per-resource detail gap in one DRY factory.
+_DETAIL_RESOURCES = {
+    'column':            ('pm/board-columns', 'Board column'),
+    'user':              ('system/users', 'User'),
+    'client':            ('system/clients', 'Client'),
+    'contract-type':     ('system/contract-types', 'Contract type'),
+    'contract-block':    ('system/contract-blocks', 'Contract block'),
+    'contract-template': ('system/contract-templates', 'Contract template'),
+    'lead':              ('sales/leads', 'Lead'),
+    'offer':             ('sales/offers', 'Offer'),
+    'offer-line':        ('sales/offer-lines', 'Offer line'),
+    'contract':          ('sales/contracts', 'Contract'),
+    'pipeline':          ('sales/pipelines', 'Pipeline'),
+    'pipeline-stage':    ('sales/pipeline-stages', 'Pipeline stage'),
+    'email-task':        ('sales/email-tasks', 'Email task'),
+}
+
+
+def _make_detail_cmd(prefix: str, label: str):
+    def _handler(args):
+        data = _get(f'/api/v1/pat/{prefix}/{args.id}/')
+        if args.json:
+            _json_out(data)
+            return
+        ident = data.get('id', args.id) if isinstance(data, dict) else args.id
+        print(f'\n  {label} #{ident}\n')
+        if isinstance(data, dict):
+            for k, v in data.items():
+                sval = str(v)
+                if len(sval) > 200:
+                    sval = sval[:200] + '...'
+                print(f'  {k}: {sval}')
+        else:
+            _json_out(data)
+        print()
+
+    _handler.__name__ = 'cmd_detail_' + prefix.replace('/', '_').replace('-', '_')
+    _handler.__doc__ = f'Retrieve a single {label.lower()} by ID.'
+    return _handler
+
+
+# ---------------------------------------------------------------------------
 # Commands: Generic — `api` escape hatch for any PAT endpoint
 # ---------------------------------------------------------------------------
 
@@ -1952,17 +2235,29 @@ def cmd_api(args):
 # ---------------------------------------------------------------------------
 
 def cmd_tokens(args):
-    """List PATs. Note: token management requires JWT auth, not PAT.
-    This command may fail with 401 if called with PAT auth only.
-    Use the C2 web UI to manage tokens: {url}/c2/tokens
-    """
-    try:
-        data = _get('/api/v1/pat/tokens/')
-    except SystemExit:
-        print('  Token management requires web login (JWT auth), not PAT auth.')
-        print(f'  Manage tokens at: {_get_url()}/c2/tokens')
-        return
+    """PAT management via web login (JWT). Actions: list (default), scopes, create, revoke.
 
+    The /pat/tokens/ endpoints reject PAT auth by design — a token must never be
+    able to mint or revoke tokens — so these mirror the C2 web UI and
+    authenticate with a short-lived password login (see _resolve_login /
+    _jwt_login). `scopes` also works offline via the static capability map.
+    """
+    action = getattr(args, 'action', None) or 'list'
+    if action == 'scopes':
+        _tokens_scopes(args)
+    elif action == 'create':
+        _tokens_create(args)
+    elif action == 'revoke':
+        _tokens_revoke(args)
+    else:
+        _tokens_list(args)
+
+
+def _tokens_list(args):
+    """List PATs (GET /pat/tokens/, JWT). Creation/revoke also work via login now."""
+    username, password = _resolve_login(args)
+    access = _jwt_login(username, password)
+    data = _jwt_request('GET', '/api/v1/pat/tokens/', access)
     results = data.get('results', data) if isinstance(data, dict) else data
 
     if args.json:
@@ -1976,11 +2271,93 @@ def cmd_tokens(args):
             t.get('id', ''),
             t.get('prefix', ''),
             t.get('name', ''),
+            ','.join(t.get('scopes') or []),
             _ago(t.get('last_used')),
             'active' if t.get('is_active') else 'revoked',
         ])
-    _table(['ID', 'Prefix', 'Name', 'Last Used', 'Status'], rows)
+    _table(['ID', 'Prefix', 'Name', 'Scopes', 'Last Used', 'Status'], rows)
     print()
+
+
+def _tokens_scopes(args):
+    """Show the scope -> capability map. Also fetches the deployment's live
+    available-scopes set when --user + $TARK_PASSWORD are present (no prompt)."""
+    live = None
+    username = getattr(args, 'user', None) or _load_config().get('user', '')
+    password = os.environ.get('TARK_PASSWORD', '')
+    if username and password:
+        access = _jwt_login(username, password)
+        data = _jwt_request('GET', '/api/v1/pat/tokens/available-scopes/', access)
+        if isinstance(data, list):
+            live = set(data)
+
+    if args.json:
+        _json_out({
+            'scopes': sorted(_SCOPE_CAPABILITIES),
+            'capabilities': _SCOPE_CAPABILITIES,
+            'available_on_deployment': sorted(live) if live is not None else None,
+        })
+        return
+
+    print('\n  PAT SCOPES — what each scope unlocks\n')
+    rows = [
+        [scope, ('-' if live is None else ('yes' if scope in live else 'no')),
+         _SCOPE_CAPABILITIES[scope]]
+        for scope in sorted(_SCOPE_CAPABILITIES)
+    ]
+    _table(['Scope', 'On deploy', 'Enables'], rows)
+    if live is None:
+        print('\n  (static map — set --user + $TARK_PASSWORD to also show '
+              'deployment-available scopes)')
+    print()
+
+
+def _tokens_create(args):
+    """Create a PAT (POST /pat/tokens/, JWT). Prints the token ONCE."""
+    if not getattr(args, 'name', None):
+        _err('--name is required for `tokens create`.')
+    scopes = list(getattr(args, 'scopes', None) or [])
+    if not scopes:
+        _err('At least one --scope is required (see `tokens scopes`).')
+    unknown = [s for s in scopes if s not in _SCOPE_CAPABILITIES]
+    if unknown:
+        _err(f'Unknown scope(s): {", ".join(unknown)}. '
+             f'Valid: {", ".join(sorted(_SCOPE_CAPABILITIES))}.')
+
+    body = {'name': args.name, 'scopes': scopes}
+    if getattr(args, 'expires', None):
+        if not re.match(r'^\d{4}-\d{2}-\d{2}$', args.expires):
+            _err('--expires must be YYYY-MM-DD.')
+        body['expires_at'] = f'{args.expires}T23:59:59'
+
+    username, password = _resolve_login(args)
+    access = _jwt_login(username, password)
+    data = _jwt_request('POST', '/api/v1/pat/tokens/', access, body=body)
+
+    if args.json:
+        _json_out(data)
+        return
+
+    token = data.get('token', '') if isinstance(data, dict) else ''
+    print(f"\n  Created PAT #{data.get('id')}: {data.get('name', '')}")
+    print(f"  Scopes: {', '.join(data.get('scopes') or scopes)}")
+    print('\n  +-------------------------------------------------------------+')
+    print('  |  STORE THIS NOW - the token is shown ONLY ONCE.             |')
+    print('  +-------------------------------------------------------------+')
+    print(f'\n  {token}\n')
+
+
+def _tokens_revoke(args):
+    """Revoke (soft-delete) a PAT (DELETE /pat/tokens/{id}/, JWT). DESTRUCTIVE."""
+    token_id = getattr(args, 'token_id', None)
+    if not token_id:
+        _err('Usage: tark_cli tokens revoke <id>')
+    _confirm_destructive(f'revoke (soft-delete) PAT #{token_id}',
+                         getattr(args, 'yes', False))
+    username, password = _resolve_login(args)
+    access = _jwt_login(username, password)
+    _jwt_request('DELETE', f'/api/v1/pat/tokens/{token_id}/', access)
+    print(f'  Revoked PAT #{token_id} (is_active=False).')
 
 
 # ---------------------------------------------------------------------------
@@ -2285,9 +2662,45 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--parent', type=int, help='Parent task ID')
     p.add_argument('--board', type=int, help='Board ID (move task to a different board)')
 
-    # contract-types, contract-templates
+    # contract-types, contract-templates, contract-blocks
     sub.add_parser('contract-types', help='Contract types (system)')
     sub.add_parser('contract-templates', help='Contract templates (system)')
+    sub.add_parser('contract-blocks', help='Contract blocks (system)')
+
+    # sites-active (c2:read) — requires --domains
+    p = sub.add_parser('sites-active', help='C2 sites active-now (needs --domains)')
+    p.add_argument('--domains', required=True, help='Comma-separated domains, e.g. a.tt.ee,b.tt.ee')
+    p.add_argument('--window', help='Activity window, e.g. 15m, 1h (default 15m)')
+
+    # boards-create (pm:write)
+    p = sub.add_parser('boards-create', help='Create a PM board')
+    p.add_argument('project', type=int, help='Project ID')
+    p.add_argument('name', help='Board name')
+
+    # comment <task_id> <body> (pm:write) — create a task comment
+    p = sub.add_parser('comment', help='Add a comment to a task')
+    p.add_argument('task_id', type=int, help='Task ID')
+    p.add_argument('body', nargs='+', help='Comment body')
+
+    # task-delete (pm:delete, DESTRUCTIVE)
+    p = sub.add_parser('task-delete', help='Delete a PM task (DESTRUCTIVE)')
+    p.add_argument('id', type=int, help='Task ID')
+    p.add_argument('--yes', '-y', action='store_true', help='Skip the confirmation prompt (for scripts)')
+
+    # time-delete (pm:write, DESTRUCTIVE)
+    p = sub.add_parser('time-delete', help='Delete a time entry (DESTRUCTIVE)')
+    p.add_argument('id', type=int, help='Time entry ID')
+    p.add_argument('--yes', '-y', action='store_true', help='Skip the confirmation prompt (for scripts)')
+
+    # offer-line-delete (sales:write, DESTRUCTIVE)
+    p = sub.add_parser('offer-line-delete', help='Delete an offer line (DESTRUCTIVE)')
+    p.add_argument('id', type=int, help='Offer line ID')
+    p.add_argument('--yes', '-y', action='store_true', help='Skip the confirmation prompt (for scripts)')
+
+    # detail retrieve commands (one per PAT resource that allows `retrieve`)
+    for _dname, (_dprefix, _dlabel) in _DETAIL_RESOURCES.items():
+        _dp = sub.add_parser(_dname, help=f'{_dlabel} detail (by ID)')
+        _dp.add_argument('id', help=f'{_dlabel} ID')
 
     # generic api escape hatch
     p = sub.add_parser('api', help='Generic request to /api/v1/pat/<path>/')
@@ -2296,8 +2709,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--post', help='POST body (JSON string)')
     p.add_argument('--patch', help='PATCH body (JSON string). Use path like "pm/tasks/123"')
 
-    # tokens
-    sub.add_parser('tokens', help='List PATs')
+    # tokens [list|scopes|create|revoke] — management via web login (JWT)
+    p = sub.add_parser('tokens', help='PAT management via web login (list/scopes/create/revoke)')
+    p.add_argument('action', nargs='?', choices=['list', 'scopes', 'create', 'revoke'],
+                   default='list', help='Default: list. Also scopes|create|revoke.')
+    p.add_argument('token_id', nargs='?', help='Token ID (for revoke)')
+    p.add_argument('--name', help='create: token name')
+    p.add_argument('--scope', action='append', dest='scopes',
+                   help='create: scope (repeatable), e.g. --scope pm:write --scope sales:read')
+    p.add_argument('--expires', help='create: expiry date YYYY-MM-DD')
+    p.add_argument('--user', help='Web-login username (else config `user`, else prompt)')
+    p.add_argument('--yes', '-y', action='store_true', help='revoke: skip the confirmation prompt')
 
     # config [set <key> <value>]
     p = sub.add_parser('config', help='Show/set config')
@@ -2347,6 +2769,13 @@ COMMANDS = {
     'projects-create': cmd_projects_create,
     'contract-types': cmd_contract_types,
     'contract-templates': cmd_contract_templates,
+    'contract-blocks': cmd_contract_blocks,
+    'sites-active': cmd_sites_active,
+    'boards-create': cmd_boards_create,
+    'comment': cmd_comment,
+    'task-delete': cmd_task_delete,
+    'time-delete': cmd_time_delete,
+    'offer-line-delete': cmd_offer_line_delete,
     'clients': cmd_clients,
     'clients-create': cmd_clients_create,
     'clients-update': cmd_clients_update,
@@ -2357,6 +2786,8 @@ COMMANDS = {
     'api': cmd_api,
     'tokens': cmd_tokens,
     'config': cmd_config,
+    # Detail (retrieve) commands — one per PAT resource that allows `retrieve`.
+    **{_n: _make_detail_cmd(_p, _l) for _n, (_p, _l) in _DETAIL_RESOURCES.items()},
 }
 
 

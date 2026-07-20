@@ -59,6 +59,15 @@ tark_cli tasks
 | `tark_cli log 1.5 123 "fixed bug"` | Log 1.5h to task #123 |
 | `tark_cli time week` | Weekly time report grouped by project |
 | `tark_cli projects` / `boards` / `columns` | Browse PM structure |
+| `tark_cli boards-create <project_id> "Board name"` | Create a board (needs `pm:write`) |
+| `tark_cli comment <task_id> "text"` | Add a task comment (needs `pm:write`) |
+| `tark_cli task-delete <id> [--yes]` | Delete a task (needs `pm:delete`, **destructive** — confirms unless `--yes`) |
+| `tark_cli time-delete <id> [--yes]` | Delete a time entry (needs `pm:write`, **destructive**) |
+| `tark_cli sites-active --domains a.tt.ee,b.tt.ee [--window 15m]` | C2 sites active-now (needs `c2:read`) |
+| `tark_cli contract-blocks` | List contract blocks (system, `sales:read`) |
+| `tark_cli <lead\|offer\|offer-line\|contract\|pipeline\|pipeline-stage\|email-task> <id>` | Retrieve one sales record by ID |
+| `tark_cli <client\|user\|contract-type\|contract-block\|contract-template\|column> <id>` | Retrieve one system/PM record by ID |
+| `tark_cli offer-line-delete <id> [--yes]` | Delete an offer line (needs `sales:write`, **destructive**) |
 | `tark_cli leads` / `offers` / `contracts` | Browse CRM |
 | `tark_cli leads create --title "Acme retrofit" --company "Acme OÜ" --pipeline Imports --source COLD` | Create a lead (needs `sales:write` PAT) |
 | `tark_cli followups-check` | Run the due-follow-up check now — creates DRAFT EmailTasks for due leads |
@@ -75,6 +84,28 @@ tark_cli tasks
 | `tark_cli api <path> --post '{...}'` / `--patch '{...}'` | Generic POST / PATCH escape hatch |
 
 Run `tark_cli --help` for the full list, or `tark_cli <command> --help` for flags.
+
+## Token management (`tokens`)
+
+PAT create/list/revoke need **web login (JWT)**, not a PAT — a token can never mint
+or revoke tokens (privilege escalation). These mirror the C2 web UI:
+
+```bash
+tark_cli tokens                       # list your PATs (prompts for login)
+tark_cli tokens scopes                # scope -> capability map (works offline)
+tark_cli tokens create --name ci-bot --scope pm:write --scope sales:read [--expires 2026-12-31]
+tark_cli tokens revoke <id> [--yes]   # soft-revoke (is_active=False), destructive
+```
+
+- **Username** — `--user`, else config `user` (`tark_cli config set user <name>`), else prompt.
+- **Password** — `getpass` prompt, or `$TARK_PASSWORD` for automation. **Never stored**, never
+  written to config; the JWT lives in memory for the one request. Put secrets in
+  `~/.tark-secrets.env`, never inline.
+- `tokens create` prints the token **once** — store it immediately.
+
+Run the tests with `python3 -m unittest tests.test_capas_and_tokens` (or list the
+`tests.test_*` modules explicitly — plain `discover tests` collides with the root-level
+`test_website_cli.py`).
 
 ## Sales follow-up engine
 
