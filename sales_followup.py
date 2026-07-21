@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""sales_followup.py — gate-safe drafting for the sales follow-up engine (C2 #4600).
+"""sales_followup.py — gate-safe drafting for the sales follow-up engine (Feat #4600).
 
 The follow-up engine (tark-platform sales module) is a first-class EmailTask:
 

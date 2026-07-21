@@ -50,7 +50,7 @@ if (Get-Command python -ErrorAction SilentlyContinue) {
 # 4. Configure PAT + URL
 Say 'Configuring your Tark connection'
 if (Get-Command python -ErrorAction SilentlyContinue) {
-  $Url = Read-Host 'Tark deployment URL (e.g. https://ennetavhooldus.tarktoostus.ee)'
+  $Url = Read-Host 'Tark deployment URL (e.g. https://your-deployment.example.com)'
   # Mask the PAT as it's typed so it never shows on screen / in scrollback.
   $PatSecure = Read-Host 'Your PAT (tark_pat_..., hidden as you type)' -AsSecureString
   $Pat = [Runtime.InteropServices.Marshal]::PtrToStringAuto([Runtime.InteropServices.Marshal]::SecureStringToBSTR($PatSecure))

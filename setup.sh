@@ -91,7 +91,7 @@ say "Configuring your Tark connection"
 TTY=""
 if [ -t 0 ]; then TTY=/dev/stdin; elif [ -e /dev/tty ]; then TTY=/dev/tty; fi
 if [ -n "$TTY" ] && command -v python3 >/dev/null 2>&1; then
-  printf 'Tark deployment URL (e.g. https://ennetavhooldus.tarktoostus.ee): '; read -r URL < "$TTY" 2>/dev/null || true
+  printf 'Tark deployment URL (e.g. https://your-deployment.example.com): '; read -r URL < "$TTY" 2>/dev/null || true
   printf 'Your PAT (tark_pat_..., hidden as you type): '; read -rs PAT < "$TTY" 2>/dev/null || true; printf '\n'
   if [ -n "${URL:-}" ] && [ -n "${PAT:-}" ]; then
     python3 "$DEST/tark_cli.py" config set url "$URL"  >/dev/null 2>&1
@@ -106,7 +106,7 @@ if [ -n "$TTY" ] && command -v python3 >/dev/null 2>&1; then
   fi
 else
   warn "Non-interactive run — configure later with:"
-  echo "    tark_cli config set url https://YOUR-DEPLOYMENT.tarktoostus.ee"
+  echo "    tark_cli config set url https://your-deployment.example.com"
   echo "    tark_cli config set pat tark_pat_xxxxxxxxxxxxx"
 fi
 

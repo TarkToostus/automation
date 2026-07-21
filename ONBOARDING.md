@@ -18,7 +18,7 @@ developer setup** — no Homebrew, no Xcode, no manual `git`.
 2. A **Tark Personal Access Token (PAT)** — your key to push leads.
    In Tark: **Profile → Security → API keys → Add token**. Copy it once
    (`tark_pat_…`). Treat it like a password. Ask your admin if you don't see it.
-3. Your Tark **deployment URL**, e.g. `https://ennetavhooldus.tarktoostus.ee`.
+3. Your Tark **deployment URL**, e.g. `https://your-deployment.example.com`.
 
 That's it. Now pick **Path A** (nothing to install) or **Path B** (local app).
 
@@ -34,7 +34,7 @@ a terminal." Runs in a cloud sandbox that already has Python, git, and web searc
    (it's public — search for it). The sandbox clones it for you.
 3. In the chat, paste this once to configure your token (replace the two values):
    ```
-   Run: ./tark_cli.py config set url https://YOUR-DEPLOYMENT.tarktoostus.ee
+   Run: ./tark_cli.py config set url https://your-deployment.example.com
    Run: ./tark_cli.py config set pat tark_pat_xxxxxxxxxxxxx
    ```
 4. Confirm it works — type:
