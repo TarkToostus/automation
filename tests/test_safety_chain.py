@@ -501,8 +501,10 @@ class FramingTableTests(unittest.TestCase):
         self.assertEqual(self.tark._SAFETY_FRAMING['email'], 'Email (subject + body)')
 
     def test_task_framing_matches_bash(self):
-        # Keep in sync with safety_check.sh case statement (task branch).
-        self.assertEqual(self.tark._SAFETY_FRAMING['task'], 'C2 task (title + description)')
+        # Keep in sync with safety_check.sh case statement (task branch), if/when
+        # a bash implementation exists. Framing is prompt-only (not part of the
+        # SHA256 cache key), so wording changes don't affect cross-impl parity.
+        self.assertEqual(self.tark._SAFETY_FRAMING['task'], 'Tark task (title + description)')
 
 
 class ProviderGeminiAgyTests(unittest.TestCase):

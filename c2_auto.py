@@ -39,11 +39,25 @@ from pathlib import Path
 
 TARK_CLI = os.environ.get("TARK_CLI", str(Path.home() / "bin" / "tark_cli"))
 TARK_CLI_TIMEOUT = int(os.environ.get("C2_AUTO_TARK_CLI_TIMEOUT", "60"))
+
+
+def _base_url() -> str:
+    """Deployment base URL from $C2_URL or ~/.config/tark/config.json (no hardcoded
+    domain). Empty when unset, so callers print a relative path instead."""
+    url = os.environ.get("C2_URL", "")
+    if not url:
+        cfg = Path.home() / ".config" / "tark" / "config.json"
+        if cfg.exists():
+            try:
+                url = json.loads(cfg.read_text()).get("url", "")
+            except (json.JSONDecodeError, OSError):
+                url = ""
+    return url.rstrip("/")
 SIDECAR_PROJECT_ID = 28
 SIDECAR_BOARD_ID = 48
 
 # Hardcoded column IDs (board 48, defaults from orchestrator/runners/proof/c2_poller.py).
-# Stable in production. If C2 ever rebuilds the board these need bumping in lockstep
+# Stable in production. If the board is ever rebuilt these need bumping in lockstep
 # with the daemon's c2_poller.py constants.
 COLUMN_IDS = {
     "IDEA": 226,
@@ -236,10 +250,12 @@ def cmd_create(args: argparse.Namespace) -> None:
         landed = "TODO"
 
     print(f"OK: #{task_id} on {landed}")
-    print(
-        f"https://c2.tarktoostus.ee/project-management/plan/pm-projects/"
+    base = _base_url()
+    path = (
+        f"/project-management/plan/pm-projects/"
         f"{SIDECAR_PROJECT_ID}/board/{SIDECAR_BOARD_ID}/tasks/{task_id}"
     )
+    print(f"{base}{path}" if base else path)
     if landed == "TODO":
         print("Daemon PlanEngine claims within 15s (PROOF_POLL_INTERVAL_SEC).")
 

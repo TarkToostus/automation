@@ -20,7 +20,7 @@ chmod +x tark_cli.py
 #     git clone https://github.com/TarkToostus/automation.git && cd automation
 
 # 2. Configure (replace with your deployment + PAT)
-./tark_cli.py config set url https://your-deployment.tarktoostus.ee
+./tark_cli.py config set url https://your-deployment.example.com
 ./tark_cli.py config set pat tark_pat_xxxxxxxxxxxxx
 
 # 3. First call
@@ -65,7 +65,7 @@ tark_cli tasks
 | `tark_cli time-update <id> --hours 2.5 --description "..."` | Patch a time entry (sparse, needs `pm:write`) |
 | `tark_cli task-delete <id> [--yes]` | Delete a task (needs `pm:delete`, **destructive** - confirms unless `--yes`) |
 | `tark_cli time-delete <id> [--yes]` | Delete a time entry (needs `pm:write`, **destructive**) |
-| `tark_cli sites-active --domains a.tt.ee,b.tt.ee [--window 15m]` | C2 sites active-now (needs `c2:read`) |
+| `tark_cli sites-active --domains a.tt.ee,b.tt.ee [--window 15m]` | Sites active-now (needs `c2:read`) |
 | `tark_cli contract-blocks` | List contract blocks (system, `sales:read`) |
 | `tark_cli <lead\|offer\|offer-line\|contract\|pipeline\|pipeline-stage\|email-task> <id>` | Retrieve one sales record by ID |
 | `tark_cli <client\|user\|contract-type\|contract-block\|contract-template\|column> <id>` | Retrieve one system/PM record by ID |
@@ -96,7 +96,7 @@ Run `tark_cli --help` for the full list, or `tark_cli <command> --help` for flag
 ## Token management (`tokens`)
 
 PAT create/list/revoke need **web login (JWT)**, not a PAT — a token can never mint
-or revoke tokens (privilege escalation). These mirror the C2 web UI:
+or revoke tokens (privilege escalation). These mirror the web UI:
 
 ```bash
 tark_cli tokens                       # list your PATs (prompts for login)
@@ -154,7 +154,7 @@ Three ways to provide credentials, checked in order:
 
 1. **Environment variable** — `C2_PAT=tark_pat_... C2_URL=https://...`
 2. **Config file** — `~/.config/tark/config.json` (chmod 600), set via `tark_cli config set`
-3. **Defaults** — falls back to `https://c2.tarktoostus.ee` if no URL configured
+3. **No default** — set the URL via `tark_cli config set url ...` or `C2_URL`; the CLI errors with guidance if none is configured
 
 Run `tark_cli config` to see what's currently in effect.
 

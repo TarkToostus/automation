@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-tark - CLI for Tark Platform C2.
+tark - CLI for the Tark Platform.
 
 Standalone Python script (stdlib only, no pip deps).
-Authenticates via PAT token against the C2 API.
+Authenticates via PAT token against the Tark API.
 
 INVARIANT - every PAT-exposed API endpoint must have a CLI command.
     When you add or extend a resource in any `backend/*/api/pat_urls.py`,
@@ -62,7 +62,7 @@ Usage (binary installed as `tark_cli` at ~/bin/tark_cli; examples below use that
     tark_cli contract-types                 # Contract types (system)
     tark_cli contract-templates             # Contract templates (system)
     tark_cli contract-blocks                # Contract blocks (system)
-    tark_cli sites-active --domains a,b     # C2 sites active-now (c2:read)
+    tark_cli sites-active --domains a,b     # sites active-now (c2:read)
     tark_cli clients [--search=X]           # Tenant clients
 
     # Detail (retrieve) by ID - one per PAT resource that allows retrieve:
@@ -121,7 +121,7 @@ from pathlib import Path
 
 CONFIG_DIR = Path.home() / '.config' / 'tark'
 CONFIG_FILE = CONFIG_DIR / 'config.json'
-DEFAULT_URL = 'https://c2.tarktoostus.ee'
+DEFAULT_URL = ''  # no baked-in deployment URL; set via `config set url` or C2_URL
 
 
 def _load_config() -> dict:
@@ -151,7 +151,12 @@ def _get_pat() -> str:
 
 
 def _get_url() -> str:
-    return os.environ.get('C2_URL', '') or _load_config().get('url', '') or DEFAULT_URL
+    url = os.environ.get('C2_URL', '') or _load_config().get('url', '') or DEFAULT_URL
+    if not url:
+        _err('No deployment URL configured. Set it with:\n'
+             '  tark_cli config set url https://your-deployment.example.com\n'
+             'or export C2_URL=https://your-deployment.example.com')
+    return url
 
 
 def _get_user_id() -> int | None:
@@ -248,7 +253,7 @@ def _put(path: str, body: dict | None = None) -> dict | list:
 #
 # The /api/v1/pat/tokens/ endpoints reject PAT auth by design: a token must never
 # be able to mint or revoke tokens (privilege escalation). So token management
-# mirrors the C2 web UI - obtain a short-lived JWT via password login and use it
+# mirrors the web UI - obtain a short-lived JWT via password login and use it
 # for that one request. The password is NEVER stored: it comes from a getpass
 # prompt or $TARK_PASSWORD (for automation), and the JWT lives in memory for the
 # request lifetime only. Do NOT write a password to config or any file.
@@ -365,7 +370,7 @@ def _confirm_destructive(action_desc: str, assume_yes: bool) -> None:
 # ---------------------------------------------------------------------------
 
 _SCOPE_CAPABILITIES = {
-    'c2:read':     'Read C2 deployments + sites active-now',
+    'c2:read':     'Read deployments + sites active-now',
     'pm:read':     'Read PM projects, boards, columns, tasks, comments, time entries',
     'pm:write':    'Create/update PM tasks, comments, boards, columns, projects, timers, time entries',
     'pm:delete':   'Delete PM tasks',
@@ -391,7 +396,7 @@ _SAFETY_PROMPT = (
 
 _SAFETY_FRAMING = {
     'wiki': 'Task wiki / PRD body',
-    'task': 'C2 task (title + description)',
+    'task': 'Tark task (title + description)',
     'comment': 'Task comment body',
     'email': 'Email (subject + body)',
 }
@@ -951,7 +956,7 @@ def cmd_task(args):
     """Task detail."""
     data = _get(f'/api/v1/pat/pm/tasks/{args.id}/')
 
-    # Single source of truth for the C2 web URL - downstream callers
+    # Single source of truth for the deployment URL - downstream callers
     # (orchestrator/daemon/cli_tools/aims.py, etc.) should NOT rebuild this
     # from project_id + board + id. Keep the format here.
     if isinstance(data, dict) and data.get('id') and data.get('project_id') and data.get('board'):
@@ -1010,7 +1015,7 @@ def _resolve_board(project_id: int, board_arg: str | None) -> int:
     boards = _get('/api/v1/pat/pm/boards/', project=project_id)
     results = boards.get('results', boards) if isinstance(boards, dict) else boards
     if not results:
-        _err(f'Project {project_id} has no boards. Create one in C2 first.')
+        _err(f'Project {project_id} has no boards. Create one in the app first.')
 
     if board_arg is None:
         if len(results) > 1:
@@ -2093,7 +2098,7 @@ def cmd_contract_blocks(args):
 
 
 def cmd_sites_active(args):
-    """Active-now C2 sites (GET /c2/sites/active-now/) - c2:read.
+    """Active-now sites (GET /c2/sites/active-now/) - c2:read.
 
     The endpoint 400s without a domain set, so --domains is required.
     """
@@ -2114,7 +2119,7 @@ def cmd_sites_active(args):
     ]
     _table(['Domain', 'Active', 'Last event'], rows)
     if data.get('missing_domains'):
-        print(f'\n  Not tracked in C2: {", ".join(data["missing_domains"])}')
+        print(f'\n  Not tracked: {", ".join(data["missing_domains"])}')
     print()
 
 
@@ -2467,7 +2472,7 @@ def cmd_tokens(args):
     """PAT management via web login (JWT). Actions: list (default), scopes, create, revoke.
 
     The /pat/tokens/ endpoints reject PAT auth by design - a token must never be
-    able to mint or revoke tokens - so these mirror the C2 web UI and
+    able to mint or revoke tokens - so these mirror the web UI and
     authenticate with a short-lived password login (see _resolve_login /
     _jwt_login). `scopes` also works offline via the static capability map.
     """
@@ -2617,7 +2622,7 @@ def cmd_config(args):
         print()
         print('  Quick setup:')
         print('    tark_cli config set pat tark_pat_...')
-        print('    tark_cli config set url https://c2.tarktoostus.ee')
+        print('    tark_cli config set url https://your-deployment.example.com')
         print('    tark_cli config set user_id 38')
     else:
         for k, v in cfg.items():
@@ -2627,7 +2632,8 @@ def cmd_config(args):
     # Show effective values
     print()
     print('  Effective:')
-    print(f'    URL:     {_get_url()}')
+    url = os.environ.get('C2_URL', '') or cfg.get('url', '')
+    print(f'    URL:     {url or "(not set)"}')
     pat = os.environ.get('C2_PAT', '') or cfg.get('pat', '')
     print(f'    PAT:     {"***" + pat[-6:] if pat else "(not set)"}')
     print(f'    User ID: {_get_user_id() or "(not set)"}')
@@ -2644,7 +2650,7 @@ def build_parser() -> argparse.ArgumentParser:
     prog_name = Path(sys.argv[0]).name if sys.argv and sys.argv[0] else 'tark_cli'
     parser = argparse.ArgumentParser(
         prog=prog_name,
-        description='Tark Platform C2 CLI',
+        description='Tark Platform CLI',
     )
     parser.add_argument('--json', action='store_true', help='Output raw JSON')
     parser.add_argument(
@@ -2654,7 +2660,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         '--pat',
-        help='Explicit C2 PAT (overrides env + config file)',
+        help='Explicit Tark PAT (overrides env + config file)',
     )
     parser.add_argument(
         '--pat-env', dest='pat_env',
@@ -2897,7 +2903,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser('contract-blocks', help='Contract blocks (system)')
 
     # sites-active (c2:read) - requires --domains
-    p = sub.add_parser('sites-active', help='C2 sites active-now (needs --domains)')
+    p = sub.add_parser('sites-active', help='sites active-now (needs --domains)')
     p.add_argument('--domains', required=True, help='Comma-separated domains, e.g. a.tt.ee,b.tt.ee')
     p.add_argument('--window', help='Activity window, e.g. 15m, 1h (default 15m)')
 
