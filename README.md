@@ -52,7 +52,11 @@ tark_cli tasks
 |---------|-------------|
 | `tark_cli tasks` | My open tasks across all projects |
 | `tark_cli tasks --project Sigma` | Tasks in a specific project |
+| `tark_cli tasks --board 100 --status WORK --all` | Board-scoped column listing (follows pagination; a project can hold several boards) |
 | `tark_cli task 123` | Task detail |
+| `tark_cli deps 200` | Task dependencies, both directions (blocked by / blocks) |
+| `tark_cli deps 200 add --blocker 201` | Record a blocker (needs `pm:write`) |
+| `tark_cli deps 200 remove --blocker 201` | Drop a blocker (needs `pm:delete`) |
 | `tark_cli create <project> "Subject text"` | Create a task |
 | `tark_cli timer` | Active timer state |
 | `tark_cli start 123` / `stop` / `discard` | Timer control |
@@ -193,7 +197,7 @@ If you find a security issue, email `security@tarktoostus.ee` rather than openin
 
 PAT auth covers the workflow API surface:
 
-- `pm/` — projects, boards, columns, tasks, comments, time entries, timer
+- `pm/` — projects, boards, columns, tasks, task dependencies, comments, time entries, timer
 - `sales/` — leads, offers, offer-lines, contracts, pipelines, email-tasks (the follow-up engine), enqueue trigger (`config/enqueue-followups`)
 - `system/` — clients, contract-types, contract-templates
 - `c2/` — deployment status (read-only)

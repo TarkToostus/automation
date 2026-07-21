@@ -122,6 +122,10 @@ from pathlib import Path
 CONFIG_DIR = Path.home() / '.config' / 'tark'
 CONFIG_FILE = CONFIG_DIR / 'config.json'
 DEFAULT_URL = ''  # no baked-in deployment URL; set via `config set url` or TARK_URL/C2_URL
+# Page-follow cap for `tasks`. The server caps a page at 50 rows, so this bounds a
+# full list at 2000 tasks — well above any single board, and a hard stop so a
+# runaway `next` chain can never loop forever.
+TASKS_MAX_PAGES = 40
 
 
 def _load_config() -> dict:
@@ -731,6 +735,11 @@ def _err(msg: str) -> None:
     sys.exit(1)
 
 
+def _warn(msg: str) -> None:
+    """Non-fatal notice. stderr, so it never corrupts `--json` stdout."""
+    print(f'Warning: {msg}', file=sys.stderr)
+
+
 def _json_out(data) -> None:
     print(json.dumps(data, indent=2, default=str))
 
@@ -935,8 +944,32 @@ def cmd_tasks(args):
     if args.status:
         params['board_card__column__name'] = args.status
 
-    data = _get('/api/v1/pat/pm/tasks/', **params)
-    results = data.get('results', data) if isinstance(data, dict) else data
+    # Paginate. The server caps a page at 50 rows regardless of `limit`/`page_size`,
+    # so a single call silently truncates any column past 50 (WORK on board 48 was
+    # 52 on 2026-07-21). The daemon ranks its pick queue CLIENT-side (priority +
+    # created_at FIFO, orchestrator #218), so a truncated page does not just hide
+    # the tail — it hides exactly the OLDEST tasks that FIFO order exists to reach,
+    # because the server sorts by -updated_at. Same class of silent wrongness as
+    # the dropped filter params in #5478: the list looks complete either way.
+    #
+    # CEILING: this is offset pagination (page N) over a MUTABLE sort key
+    # (-updated_at). If a row's updated_at changes while this walk is mid-flight
+    # (a concurrent edit between fetching page 1 and page 2), it can shift across
+    # the page boundary and appear twice or be skipped once. Not fixable client-
+    # side; would need server-side cursor pagination or a stable tiebreaker (id).
+    # Accepted for now because the daemon re-polls every ~30s (orchestrator
+    # daemon.py), so a skip self-heals within one tick.
+    results = []
+    for page in range(1, TASKS_MAX_PAGES + 1):
+        data = _get('/api/v1/pat/pm/tasks/', page=str(page), **params)
+        if not isinstance(data, dict):
+            results = data
+            break
+        results.extend(data.get('results', []))
+        if not data.get('next'):
+            break
+    else:
+        _warn(f'task list truncated at {TASKS_MAX_PAGES} pages ({len(results)} rows)')
 
     if args.json:
         _json_out(results)
@@ -1458,6 +1491,95 @@ def cmd_columns(args):
         args,
         params={'board': args.board, 'ordering': 'order'} if getattr(args, 'board', None) else {'ordering': 'order'},
     )
+
+
+_DEPS_PATH = '/api/v1/pat/pm/task-dependencies/'
+
+
+def _deps_for(task_id: int, side: str) -> list[dict]:
+    """Dependency rows where `task_id` is the blocked_task or the blocking_task.
+
+    CEILING: single page, unlike `tasks`' page walk above. Deliberately not
+    paginated - a task's own blocker count is realistically a handful, nowhere
+    near a 50-row page, so the truncation risk `tasks` guards against does not
+    apply here. Revisit if a task ever legitimately needs 50+ dependency rows.
+    """
+    data = _get(_DEPS_PATH, **{side: str(task_id)})
+    return data.get('results', data) if isinstance(data, dict) else data
+
+
+def cmd_deps(args):
+    """Show / add / remove hard task dependencies (PM TaskDependency).
+
+    A dependency is a create-or-delete pair, never an edit — to change a blocker
+    you remove one row and add another, so there is no `set` action here.
+
+    NOTE: this is ALSO the daemon's gate only if the wiki says so. The Autopilot
+    daemon reads `Blocked by #N` / `Depends on #N` out of the task WIKI
+    (orchestrator daemon/daemon.py::_unmet_dependency); it does NOT read these
+    rows. A dependency recorded here alone will not stop the daemon picking the
+    task — mirror it into the wiki as well.
+    """
+    task_id = args.task_id
+
+    if args.action == 'add':
+        if not args.blocker:
+            _err('deps add requires --blocker <task id>')
+        if args.blocker == task_id:
+            _err('a task cannot block itself')
+        body = {
+            'blocking_task': args.blocker,
+            'blocked_task': task_id,
+            'dependency_type': args.type,
+        }
+        data = _request('POST', _DEPS_PATH, body=body)
+        if args.json:
+            _json_out(data)
+            return
+        print(f"  #{task_id} is now blocked by #{args.blocker} (dep id {data.get('id')}, {args.type})")
+        print('  Reminder: the daemon gates on the WIKI, not on this row. Add a')
+        print(f'  "Blocked by #{args.blocker}" line to #{task_id} wiki to stop it being picked.')
+        return
+
+    if args.action == 'remove':
+        if not args.blocker:
+            _err('deps remove requires --blocker <task id>')
+        # Resolve the row id from the pair — the CLI never asks a human to know it.
+        # Re-check BOTH sides of the pair client-side, never just `blocking_task`.
+        # `blocked_task=<id>` above is a server-side filter param, and this exact
+        # class of bug (DjangoFilterBackend silently drops an unregistered/renamed
+        # lookup and returns everything - #467, #5478) has hit this codebase twice.
+        # Trusting the server filtered correctly would let a same-blocker row for
+        # a DIFFERENT task get deleted instead.
+        match = [d for d in _deps_for(task_id, 'blocked_task')
+                 if d.get('blocking_task') == args.blocker and d.get('blocked_task') == task_id]
+        if not match:
+            _err(f'#{args.blocker} does not block #{task_id}')
+        removed_ids = []
+        for dep in match:
+            _request('DELETE', f"{_DEPS_PATH}{dep['id']}/")
+            removed_ids.append(dep['id'])
+            if not args.json:
+                print(f"  Removed dep {dep['id']}: #{args.blocker} no longer blocks #{task_id}")
+        if args.json:
+            _json_out({'task': task_id, 'blocker': args.blocker, 'removed': removed_ids})
+        return
+
+    blocked_by = _deps_for(task_id, 'blocked_task')
+    blocks = _deps_for(task_id, 'blocking_task')
+
+    if args.json:
+        _json_out({'task': task_id, 'blocked_by': blocked_by, 'blocks': blocks})
+        return
+
+    print(f'\n  DEPENDENCIES for #{task_id}\n')
+    if not blocked_by and not blocks:
+        print('  none\n')
+        return
+    rows = [[d.get('id'), 'blocked by', f"#{d.get('blocking_task')}", d.get('dependency_type', '')] for d in blocked_by]
+    rows += [[d.get('id'), 'blocks', f"#{d.get('blocked_task')}", d.get('dependency_type', '')] for d in blocks]
+    _table(['Dep', 'Direction', 'Task', 'Type'], rows)
+    print()
 
 
 def cmd_comments(args):
@@ -2822,6 +2944,15 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser('comments', help='Task comments')
     p.add_argument('--task', help='Filter by task ID')
 
+    # deps <task_id> [list|add|remove]
+    p = sub.add_parser('deps', help='Task dependencies (blockers) - show/add/remove')
+    p.add_argument('task_id', type=int, help='Task ID')
+    p.add_argument('action', nargs='?', default='list', choices=['list', 'add', 'remove'],
+                   help='Default: list (both directions)')
+    p.add_argument('--blocker', type=int, help='Blocking task ID (required for add/remove)')
+    p.add_argument('--type', default='finish_to_start',
+                   choices=['finish_to_start', 'finish_to_finish'], help='Dependency type')
+
     # projects-create
     p = sub.add_parser('projects-create', help='Create a PM project')
     p.add_argument('name', help='Project name')
@@ -3049,6 +3180,7 @@ COMMANDS = {
     'columns': cmd_columns,
     'columns-create': cmd_columns_create,
     'comments': cmd_comments,
+    'deps': cmd_deps,
     'projects-create': cmd_projects_create,
     'contract-types': cmd_contract_types,
     'contract-templates': cmd_contract_templates,
