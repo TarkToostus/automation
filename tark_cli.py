@@ -92,7 +92,7 @@ Usage (binary installed as `tark_cli` at ~/bin/tark_cli; examples below use that
 Note: `--json` is a top-level flag and MUST precede the subcommand, e.g.
     tark_cli --json leads --pipeline Imports
 
-Auth: C2_PAT env var, or ~/.config/tark/config.json
+Auth: TARK_PAT env var (legacy C2_PAT also works), or ~/.config/tark/config.json
 """
 
 import argparse
@@ -121,7 +121,7 @@ from pathlib import Path
 
 CONFIG_DIR = Path.home() / '.config' / 'tark'
 CONFIG_FILE = CONFIG_DIR / 'config.json'
-DEFAULT_URL = ''  # no baked-in deployment URL; set via `config set url` or C2_URL
+DEFAULT_URL = ''  # no baked-in deployment URL; set via `config set url` or TARK_URL/C2_URL
 
 
 def _load_config() -> dict:
@@ -144,23 +144,28 @@ _PAT_OVERRIDE: str = ""  # set by main() when --pat / --pat-env is supplied
 def _get_pat() -> str:
     if _PAT_OVERRIDE:
         return _PAT_OVERRIDE
-    pat = os.environ.get('C2_PAT', '') or _load_config().get('pat', '')
+    # TARK_PAT is the primary env var; C2_PAT stays a backward-compat fallback.
+    pat = (os.environ.get('TARK_PAT') or os.environ.get('C2_PAT', '')
+           or _load_config().get('pat', ''))
     if not pat:
-        _err('No PAT configured. Set C2_PAT env var or run: tark config set pat <token>')
+        _err('No PAT configured. Set TARK_PAT (or legacy C2_PAT) env var, '
+             'or run: tark config set pat <token>')
     return pat
 
 
 def _get_url() -> str:
-    url = os.environ.get('C2_URL', '') or _load_config().get('url', '') or DEFAULT_URL
+    url = (os.environ.get('TARK_URL') or os.environ.get('C2_URL', '')
+           or _load_config().get('url', '') or DEFAULT_URL)
     if not url:
         _err('No deployment URL configured. Set it with:\n'
              '  tark_cli config set url https://your-deployment.example.com\n'
-             'or export C2_URL=https://your-deployment.example.com')
+             'or export TARK_URL=https://your-deployment.example.com (legacy C2_URL also works)')
     return url
 
 
 def _get_user_id() -> int | None:
-    val = os.environ.get('C2_USER_ID', '') or _load_config().get('user_id', '')
+    val = (os.environ.get('TARK_USER_ID') or os.environ.get('C2_USER_ID', '')
+           or _load_config().get('user_id', ''))
     return int(val) if val else None
 
 
@@ -917,7 +922,7 @@ def cmd_tasks(args):
         # Task -> BoardCard -> Board -> Project (task has no direct project FK).
         # Param names must match TaskViewSet.filterset_fields exactly -
         # DjangoFilterBackend silently DROPS unregistered params, which made
-        # these filters no-ops (C2 #5478: daemon reclaim swept unfiltered lists).
+        # these filters no-ops (Feat #5478: daemon reclaim swept unfiltered lists).
         try:
             params['board_card__board__project'] = str(int(args.project))
         except ValueError:
@@ -1564,7 +1569,7 @@ def cmd_pipeline_stages(args):
 
 
 # ---------------------------------------------------------------------------
-# Commands: Sales follow-up engine (C2 #4600) - EmailTask cadence.
+# Commands: Sales follow-up engine (Feat #4600) - EmailTask cadence.
 # A due lead becomes a DRAFT EmailTask whose body IS the verbatim email.
 # followups-check enqueues DRAFTs; email-tasks lists them; email-task-set edits a
 # draft's body/subject/status. None can cross the SEND human-gate - the server
@@ -2632,9 +2637,9 @@ def cmd_config(args):
     # Show effective values
     print()
     print('  Effective:')
-    url = os.environ.get('C2_URL', '') or cfg.get('url', '')
+    url = os.environ.get('TARK_URL') or os.environ.get('C2_URL', '') or cfg.get('url', '')
     print(f'    URL:     {url or "(not set)"}')
-    pat = os.environ.get('C2_PAT', '') or cfg.get('pat', '')
+    pat = os.environ.get('TARK_PAT') or os.environ.get('C2_PAT', '') or cfg.get('pat', '')
     print(f'    PAT:     {"***" + pat[-6:] if pat else "(not set)"}')
     print(f'    User ID: {_get_user_id() or "(not set)"}')
     print()
@@ -2664,7 +2669,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         '--pat-env', dest='pat_env',
-        help='Env var name to read PAT from (overrides default C2_PAT)',
+        help='Env var name to read PAT from (overrides the default TARK_PAT/C2_PAT lookup)',
     )
     sub = parser.add_subparsers(dest='command')
 
@@ -3084,7 +3089,7 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
 
-    # Resolve PAT override: --pat > --pat-env > C2_PAT env > config.json
+    # Resolve PAT override: --pat > --pat-env > TARK_PAT/C2_PAT env > config.json
     if args.pat:
         _PAT_OVERRIDE = args.pat
     elif args.pat_env:

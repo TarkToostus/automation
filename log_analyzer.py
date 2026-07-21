@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """log_analyzer -- warmup-style digest of the fleet's Loki logs + Prometheus metrics.
 
-The observe.tarktoostus.ee stack (Grafana + Loki + Prometheus) collects every VM's
+The observability stack (Grafana + Loki + Prometheus) collects every VM's
 nginx access logs, container logs and django-prometheus metrics -- but nothing reads
 them programmatically. Sentry only sees SDK-instrumented exceptions + sampled perf
 spans; it never sees the nginx status-code distribution (5xx/429/499), the offending
 paths, or per-view latency percentiles. This closes that gap.
 
+Config: set $OBSERVE_URL to your observability host (e.g. https://observe.example.com).
 Auth: orchestrator/shared/secrets.env (LOKI_PASSWORD, GRAFANA_ADMIN_PASSWORD).
 Callers (the /warmup + /log-analyzer skills) MUST NOT need to know the creds.
 
-Sources (both publicly reachable through observe.tarktoostus.ee):
-  - Loki        https://observe.tarktoostus.ee/loki/api/v1/...        (basic auth loki:LOKI_PASSWORD)
+Sources (both reachable through your observability host, $OBSERVE_URL):
+  - Loki        $OBSERVE_URL/loki/api/v1/...                          (basic auth loki:LOKI_PASSWORD)
   - Prometheus  via Grafana datasource proxy                          (basic auth admin:GRAFANA_ADMIN_PASSWORD)
-                prometheus.observe.* has NO public DNS -- proxy is the only path.
+                the Prometheus host has NO public DNS -- proxy is the only path.
 
 Sections:
   STATUS  HTTP 4xx/5xx/429/499 by status x environment (nginx, Loki)
@@ -38,13 +39,16 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
-OBSERVE = "https://observe.tarktoostus.ee"
+# Observability host - no baked-in domain. Set $OBSERVE_URL (validated at runtime
+# in load_creds so `import log_analyzer` stays side-effect-free).
+OBSERVE = os.environ.get("OBSERVE_URL", "").rstrip("/")
 SECRETS = Path.home() / "_tark" / "orchestrator" / "shared" / "secrets.env"
 SECTIONS = ["STATUS", "PATHS", "ERR", "SLOW", "APP5XX"]
 
@@ -80,6 +84,12 @@ THRESH = {
 
 
 def load_creds() -> dict:
+    if not OBSERVE:
+        sys.stderr.write(
+            "log_analyzer: no observability host configured. Set it with:\n"
+            "  export OBSERVE_URL=https://your-observability-host.example.com\n"
+        )
+        sys.exit(1)
     if not SECRETS.exists():
         sys.stderr.write(
             f"log_analyzer: missing {SECRETS} (LOKI_PASSWORD, GRAFANA_ADMIN_PASSWORD)\n"

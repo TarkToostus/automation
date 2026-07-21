@@ -152,9 +152,9 @@ commands need `sales:write`.
 
 Three ways to provide credentials, checked in order:
 
-1. **Environment variable** — `C2_PAT=tark_pat_... C2_URL=https://...`
+1. **Environment variable** — `TARK_PAT=tark_pat_... TARK_URL=https://...` (legacy `C2_PAT`/`C2_URL` still work)
 2. **Config file** — `~/.config/tark/config.json` (chmod 600), set via `tark_cli config set`
-3. **No default** — set the URL via `tark_cli config set url ...` or `C2_URL`; the CLI errors with guidance if none is configured
+3. **No default** — set the URL via `tark_cli config set url ...` or `TARK_URL` (legacy `C2_URL`); the CLI errors with guidance if none is configured
 
 Run `tark_cli config` to see what's currently in effect.
 

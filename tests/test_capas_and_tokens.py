@@ -268,6 +268,48 @@ class TokensRevokeTests(unittest.TestCase):
             tark_cli._tokens_revoke(_ns(token_id=None, user=None, yes=True))
 
 
+class EnvAliasFallbackTests(unittest.TestCase):
+    """TARK_* is the primary env var; C2_* stays a backward-compat fallback."""
+
+    def setUp(self):
+        # Neutralize config so only env vars drive the result.
+        self._cfg = mock.patch.object(tark_cli, '_load_config', lambda: {})
+        self._cfg.start()
+        self.addCleanup(self._cfg.stop)
+        tark_cli._PAT_OVERRIDE = ''
+
+    def _env(self, **kw):
+        base = {'TARK_PAT': '', 'C2_PAT': '', 'TARK_URL': '', 'C2_URL': '',
+                'TARK_USER_ID': '', 'C2_USER_ID': ''}
+        base.update(kw)
+        return mock.patch.dict('os.environ', base, clear=False)
+
+    def test_tark_pat_wins_over_c2_pat(self):
+        with self._env(TARK_PAT='primary', C2_PAT='legacy'):
+            self.assertEqual(tark_cli._get_pat(), 'primary')
+
+    def test_c2_pat_fallback_when_tark_unset(self):
+        with self._env(C2_PAT='legacy'):
+            self.assertEqual(tark_cli._get_pat(), 'legacy')
+
+    def test_tark_url_wins_then_c2_url_fallback(self):
+        with self._env(TARK_URL='https://a.example.com', C2_URL='https://b.example.com'):
+            self.assertEqual(tark_cli._get_url(), 'https://a.example.com')
+        with self._env(C2_URL='https://b.example.com'):
+            self.assertEqual(tark_cli._get_url(), 'https://b.example.com')
+
+    def test_tark_user_id_wins_then_c2_fallback(self):
+        with self._env(TARK_USER_ID='11', C2_USER_ID='22'):
+            self.assertEqual(tark_cli._get_user_id(), 11)
+        with self._env(C2_USER_ID='22'):
+            self.assertEqual(tark_cli._get_user_id(), 22)
+
+    def test_no_env_no_config_errors(self):
+        with self._env(), mock.patch.object(sys, 'stderr', io.StringIO()), \
+                self.assertRaises(SystemExit):
+            tark_cli._get_url()
+
+
 class LoginCredentialTests(unittest.TestCase):
     def test_password_from_env_never_persisted(self):
         """$TARK_PASSWORD is used but NEVER written to config (no _save_config)."""

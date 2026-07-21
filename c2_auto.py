@@ -42,9 +42,9 @@ TARK_CLI_TIMEOUT = int(os.environ.get("C2_AUTO_TARK_CLI_TIMEOUT", "60"))
 
 
 def _base_url() -> str:
-    """Deployment base URL from $C2_URL or ~/.config/tark/config.json (no hardcoded
-    domain). Empty when unset, so callers print a relative path instead."""
-    url = os.environ.get("C2_URL", "")
+    """Deployment base URL from $TARK_URL/$C2_URL or ~/.config/tark/config.json (no
+    hardcoded domain). Empty when unset, so callers print a relative path instead."""
+    url = os.environ.get("TARK_URL") or os.environ.get("C2_URL", "")
     if not url:
         cfg = Path.home() / ".config" / "tark" / "config.json"
         if cfg.exists():
