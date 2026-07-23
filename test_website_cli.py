@@ -5,6 +5,9 @@ Run: python3 -m unittest automation.test_website_cli   (from _tark/)
   or: python3 automation/test_website_cli.py
 """
 
+import argparse
+import contextlib
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -141,6 +144,83 @@ class ProofLocate(unittest.TestCase):
         d = Path(self.tmp.name) / "elsewhere"
         d.mkdir()
         self.assertEqual(w.find_proof_dir(self.repo, "1", override=str(d)), d.resolve())
+
+
+class PageIdResolution(unittest.TestCase):
+    """coverage's PAGE_ID accepts 4 forms: route, module/slug, module--slug,
+    and a bare usePagePath-style slug key."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = make_repo(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_route_form(self):
+        module, slug, art = w.resolve_page_id(self.repo, "/mes-batch/plan/batch-orders")
+        self.assertEqual((module, slug), ("mes-batch", "batch-orders"))
+        self.assertIsNotNone(art)
+
+    def test_module_slash_slug_form(self):
+        module, slug, art = w.resolve_page_id(self.repo, "workforce/employees")
+        self.assertEqual((module, slug), ("workforce", "employees"))
+        self.assertIsNotNone(art)
+
+    def test_module_dashdash_slug_form(self):
+        module, slug, art = w.resolve_page_id(self.repo, "mes-batch--batch-orders")
+        self.assertEqual((module, slug), ("mes-batch", "batch-orders"))
+        self.assertIsNotNone(art)
+
+    def test_bare_usepagepath_key_form(self):
+        module, slug, art = w.resolve_page_id(self.repo, "employees")
+        self.assertEqual((module, slug), ("workforce", "employees"))
+        self.assertIsNotNone(art)
+
+    def test_unresolvable_id_has_no_article(self):
+        module, slug, art = w.resolve_page_id(self.repo, "/nowhere/at-all")
+        self.assertIsNone(art)
+
+
+class CoverageProbe(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = make_repo(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_missing_page_fails_the_gate(self):
+        result = w.coverage_for_page(self.repo, "/nowhere/at-all", 28, 50)
+        self.assertEqual(result["status"], "MISSING")
+        self.assertFalse(result["exists"])
+        self.assertTrue(result["reasons"])
+
+    def test_brand_new_uncommitted_doc_reads_fresh(self):
+        # the fixture repo is NOT a git checkout, so `git log` finds no history
+        # for the article -- the same signal a real just-scaffolded, uncommitted
+        # doc gives. Contract: reads FRESH, not STALE, by design.
+        result = w.coverage_for_page(self.repo, "/mes-batch/plan/batch-orders", 28, 50)
+        self.assertEqual(result["status"], "FRESH")
+        self.assertIsNone(result["age_days"])
+
+    def test_human_renders_one_line_per_page_and_exit_1_on_any_miss(self):
+        args = argparse.Namespace(
+            repo=str(self.repo),
+            pages=["/mes-batch/plan/batch-orders", "/nowhere/at-all"],
+            human=True,
+            max_age_days=28,
+            max_loc_delta=50,
+            source=None,
+        )
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = w.cmd_coverage(args)
+        lines = [ln for ln in buf.getvalue().splitlines() if ln.strip()]
+        self.assertEqual(len(lines), 2)
+        self.assertIn("[OK]", lines[0])
+        self.assertIn("[MISS]", lines[1])
+        self.assertEqual(rc, 1)
 
 
 if __name__ == "__main__":

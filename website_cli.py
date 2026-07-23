@@ -17,6 +17,8 @@ runs `git commit` / `gh pr` (the deliberate content-ops-only boundary).
                        [--tasks ID,ID] [--slugs module/slug,...]
     website refresh [--from-proof TASK --page R] [--clean]
                     [--skip-capture] [--skip-build] [--skip-website] [--commit] [--push]
+    website coverage PAGE_ID [PAGE_ID ...] [--human] [--max-age-days N] [--max-loc-delta N]
+                    # deterministic doc-exists/pics/ee/freshness probe; exit 1 if any MISSING/STALE
 
 Checkout resolution: every command operates on a *tark-platform checkout*. It is
 taken from `--repo PATH`, else the git toplevel of CWD. The checkout must contain
@@ -32,11 +34,13 @@ All land in <repo>/tests/baselines/screenshots/desktop/ (gitignored).
 """
 
 import argparse
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -120,6 +124,170 @@ def route_to_module_page(repo, route):
         return best[1], best[2], best[3]
     segs = [s for s in route.split("/") if s]
     return (segs[0] if segs else "core"), (segs[-1] if segs else "index"), None
+
+
+# ---------------------------------------------------------------------------
+# coverage: deterministic "does the Help Center cover this page?" probe
+# ---------------------------------------------------------------------------
+
+
+def _find_article_in_module(repo, module, slug):
+    """docu/help/<module>/<slug>.md exact match, else fuzzy: first article whose
+    filename stem starts with slug (a partial usePagePath-style key, e.g.
+    slug='monthly' finds 'monthly-summary.md')."""
+    exact = repo / "docu" / "help" / module / f"{slug}.md"
+    if exact.exists():
+        return exact
+    module_dir = repo / "docu" / "help" / module
+    if module_dir.is_dir():
+        for md in sorted(module_dir.glob("*.md")):
+            if md.name != "_index.md" and md.stem.startswith(slug):
+                return md
+    return None
+
+
+def resolve_page_id(repo, page_id):
+    """Resolve a coverage PAGE_ID to (module, slug, article_path|None).
+
+    Accepts: a route ("/mes-batch/plan/batch-orders"), "module/slug",
+    "module--slug" (baselines naming), or a bare usePagePath-style slug key
+    ("work-orders", or the legacy composite "workforce-employees" — see the
+    component-registry-key warning in MenuPathContext.tsx).
+    """
+    pid = (page_id or "").strip().rstrip("/")
+    if not pid:
+        return "core", "", None
+
+    if pid.startswith("/"):
+        return route_to_module_page(repo, pid)
+
+    if "--" in pid:
+        module, slug = pid.split("--", 1)
+        return module, slug, _find_article_in_module(repo, module, slug)
+
+    if "/" in pid:
+        module, slug = pid.split("/", 1)
+        return module, slug, _find_article_in_module(repo, module, slug)
+
+    # bare slug: exact filename-stem match across all modules first
+    for module, md, _page in iter_help_articles(repo):
+        if md.stem == pid:
+            return module, pid, md
+
+    # legacy composite key "<module>-<partial-slug>": peel off a module-dir
+    # prefix, fuzzy-match the remainder against that module's article stems
+    help_dir = repo / "docu" / "help"
+    if help_dir.exists():
+        for module_dir in sorted(help_dir.iterdir()):
+            if module_dir.is_dir() and pid.startswith(f"{module_dir.name}-"):
+                remainder = pid[len(module_dir.name) + 1 :]
+                art = _find_article_in_module(repo, module_dir.name, remainder)
+                if art:
+                    return module_dir.name, art.stem, art
+
+    return "core", pid, None
+
+
+def pic_count(repo, module, slug):
+    """Hero + step shots for a page in the baselines dir."""
+    d = baselines_dir(repo)
+    hero = 1 if (d / f"{module}--{slug}.png").exists() else 0
+    steps = len(list(d.glob(f"{module}--{slug}--*.png")))
+    return hero + steps
+
+
+def ee_present(article):
+    return article is not None and (article.parent / "ee" / article.name).exists()
+
+
+def _pascal(segment):
+    return "".join(part.capitalize() for part in segment.split("-"))
+
+
+def default_source_dir(repo, module, slug):
+    """frontend/src/pages/<PascalModule>/<PascalSlug>/ — the naive kebab->Pascal
+    guess. Doesn't always hit (e.g. some module dirs don't mirror the docu/help
+    slug 1:1) — override with --source when it misses."""
+    return repo / "frontend" / "src" / "pages" / _pascal(module) / _pascal(slug)
+
+
+def _git_out(repo, args):
+    try:
+        return subprocess.check_output(
+            ["git", "-C", str(repo)] + args, text=True, stderr=subprocess.DEVNULL
+        ).strip()
+    except subprocess.CalledProcessError:
+        return ""
+
+
+def _shortstat_loc(text):
+    """Sum insertions+deletions out of a `git diff --shortstat` line, or 0."""
+    total = 0
+    for m in re.finditer(r"(\d+) insertion", text):
+        total += int(m.group(1))
+    for m in re.finditer(r"(\d+) deletion", text):
+        total += int(m.group(1))
+    return total
+
+
+def doc_freshness(repo, article, source_dir, max_age_days, max_loc_delta):
+    """(status, age_days|None, loc_delta|None) for one article.
+
+    A brand-new, uncommitted doc is FRESH by design — there is no prior commit
+    to diff against yet (a freshly scaffolded article must not immediately
+    gate red; see /pr Step 7b).
+    """
+    rel = str(article.relative_to(repo))
+    commit = _git_out(repo, ["log", "-1", "--format=%H", "--", rel])
+    if not commit:
+        return "FRESH", None, None
+
+    commit_ts = _git_out(repo, ["log", "-1", "--format=%ct", "--", rel])
+    age_days = (time.time() - int(commit_ts)) / 86400.0 if commit_ts else None
+
+    loc_delta = None
+    if source_dir and source_dir.is_dir():
+        try:
+            rel_source = str(source_dir.relative_to(repo))
+        except ValueError:
+            rel_source = None
+        if rel_source:
+            loc_delta = _shortstat_loc(_git_out(repo, ["diff", "--shortstat", commit, "--", rel_source]))
+
+    stale = age_days is not None and age_days > max_age_days and loc_delta is not None and loc_delta > max_loc_delta
+    return ("STALE" if stale else "FRESH"), age_days, loc_delta
+
+
+def coverage_for_page(repo, page_id, max_age_days, max_loc_delta, source_override=None):
+    module, slug, article = resolve_page_id(repo, page_id)
+    exists = article is not None
+    pics = pic_count(repo, module, slug) if module and slug else 0
+    ee = ee_present(article)
+    reasons = []
+
+    if not exists:
+        status, age_days, loc_delta = "MISSING", None, None
+        reasons.append("no article found")
+    else:
+        source_dir = (
+            Path(source_override).expanduser().resolve() if source_override else default_source_dir(repo, module, slug)
+        )
+        status, age_days, loc_delta = doc_freshness(repo, article, source_dir, max_age_days, max_loc_delta)
+        if status == "STALE":
+            reasons.append(f"doc age {age_days:.0f}d>{max_age_days}d and source LOC delta {loc_delta}>{max_loc_delta}")
+
+    return {
+        "page_id": page_id,
+        "module": module,
+        "slug": slug,
+        "exists": exists,
+        "pics": pics,
+        "ee": ee,
+        "status": status,
+        "age_days": round(age_days, 1) if age_days is not None else None,
+        "loc_delta": loc_delta,
+        "reasons": reasons,
+    }
 
 
 def find_proof_dir(repo, task, override=None):
@@ -524,6 +692,35 @@ def cmd_refresh(args):
     return 0
 
 
+STATUS_TAG = {"FRESH": "[OK]", "STALE": "[STALE]", "MISSING": "[MISS]"}
+
+
+def cmd_coverage(args):
+    repo = resolve_repo(args)
+    page_ids = list(args.pages)
+    if not page_ids and not sys.stdin.isatty():
+        page_ids = [ln.strip() for ln in sys.stdin if ln.strip()]
+    if not page_ids:
+        sys.exit("[ERROR] no PAGE_ID given (pass as args or pipe a list on stdin)")
+
+    results = [
+        coverage_for_page(repo, pid, args.max_age_days, args.max_loc_delta, args.source)
+        for pid in page_ids
+    ]
+
+    if args.human:
+        for r in results:
+            reason = f"  ({'; '.join(r['reasons'])})" if r["reasons"] else ""
+            print(
+                f"{STATUS_TAG[r['status']]} {r['page_id']}  {r['status']} "
+                f"pics={r['pics']} ee={'y' if r['ee'] else 'n'}{reason}"
+            )
+    else:
+        print(json.dumps(results, indent=2))
+
+    return 1 if any(r["status"] != "FRESH" for r in results) else 0
+
+
 # ---------------------------------------------------------------------------
 # arg parsing
 # ---------------------------------------------------------------------------
@@ -592,6 +789,14 @@ def build_parser():
     s.add_argument("--password", default=os.environ.get("TEST_PASSWORD"),
                    help="dev admin password (default: TEST_PASSWORD env var; required for capture)")
     s.set_defaults(func=cmd_refresh)
+
+    s = sub.add_parser("coverage", help="deterministic help-doc coverage probe (exists/pics/ee/freshness)")
+    s.add_argument("pages", nargs="*", help="route / module/slug / module--slug / usePagePath key; reads stdin if omitted")
+    s.add_argument("--human", action="store_true", help="one-line-per-page table instead of JSON")
+    s.add_argument("--max-age-days", dest="max_age_days", type=int, default=28)
+    s.add_argument("--max-loc-delta", dest="max_loc_delta", type=int, default=50)
+    s.add_argument("--source", help="override the frontend source dir used for LOC-drift (single-page use)")
+    s.set_defaults(func=cmd_coverage)
 
     return p
 
