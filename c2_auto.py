@@ -168,10 +168,14 @@ def assert_on_sidecar_board(task: dict) -> None:
     different and column moves would silently mistarget. Better to
     refuse than to corrupt state.
 
-    Missing/null `board` is treated as an error — a task without a board
-    field is malformed and we can't safely target columns.
+    The task-detail API emits `board_id` (with `board_name` alongside);
+    older shapes used `board`. Accept either. Missing/null in both keys is
+    treated as an error — a task without a board is malformed and we can't
+    safely target columns.
     """
     board = task.get("board")
+    if board is None:
+        board = task.get("board_id")
     if board != SIDECAR_BOARD_ID:
         die(
             f"REFUSE: task #{task.get('id')} is on board {board!r} "
@@ -430,7 +434,8 @@ def cmd_summary(args: argparse.Namespace) -> None:
         if line.startswith("## "):
             last_section = line
     print(f"#{args.task_id} {name}")
-    print(f"Column: {col}    Stage: {stage}    Board: {task.get('board')}")
+    board = task.get("board") if task.get("board") is not None else task.get("board_id")
+    print(f"Column: {col}    Stage: {stage}    Board: {board}")
     if last_section:
         print(f"Last wiki section: {last_section}")
 

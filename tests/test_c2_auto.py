@@ -100,7 +100,8 @@ def make_task(
 ) -> dict:
     return {
         "id": task_id,
-        "board": board,
+        # Real task-detail API emits `board_id` (not `board`) — mirror that shape
+        "board_id": board,
         "column": c2_auto.COLUMN_IDS.get(column_name, 0),
         "column_name": column_name,
         "stage": stage,
