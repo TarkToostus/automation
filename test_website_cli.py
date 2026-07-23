@@ -143,5 +143,53 @@ class ProofLocate(unittest.TestCase):
         self.assertEqual(w.find_proof_dir(self.repo, "1", override=str(d)), d.resolve())
 
 
+class EstonianLocaleIsEt(unittest.TestCase):
+    """Estonian is `et`. tark-platform #969 (2026-07-23) deleted every
+    docu/help/<module>/ee/ dir and build-help.py reads LOCALES=('en','et'),
+    so an `ee` path here silently degrades to English or publishes nothing.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = make_repo(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _write_mirror(self, locale):
+        d = self.repo / "docu" / "help" / "mes-batch" / locale
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "batch-orders.md").write_text(
+            '---\ntitle: "Tee partii tellimus"\npage: "/mes-batch/plan/batch-orders"\n---\nsisu\n'
+        )
+
+    def test_et_mirror_title_is_used(self):
+        self._write_mirror("et")
+        _, _, en_title, et_title, _ = w.resolve_release_item(self.repo, "mes-batch/batch-orders")
+        self.assertEqual(en_title, "Run a batch order")
+        self.assertEqual(et_title, "Tee partii tellimus")
+
+    def test_ee_mirror_is_ignored_not_silently_used(self):
+        # A resurrected ee/ dir must NOT be picked up — it would mask the fact
+        # that build-help.py never publishes it.
+        self._write_mirror("ee")
+        _, _, en_title, et_title, _ = w.resolve_release_item(self.repo, "mes-batch/batch-orders")
+        self.assertEqual(et_title, en_title, "ee/ mirror must not resolve an Estonian title")
+
+    def test_no_mirror_falls_back_to_english(self):
+        _, _, en_title, et_title, _ = w.resolve_release_item(self.repo, "mes-batch/batch-orders")
+        self.assertEqual(et_title, en_title)
+
+    def test_source_carries_no_ee_locale_path(self):
+        """Vacuity guard: assert against the file on disk, not a stub."""
+        src = Path(w.__file__).read_text(encoding="utf-8")
+        offenders = [
+            ln
+            for i, ln in enumerate(src.splitlines(), 1)
+            if ('"ee"' in ln or "'ee'" in ln or "/ee/" in ln) and not ln.lstrip().startswith("#")
+        ]
+        self.assertEqual(offenders, [], f"stale ee locale path in website_cli.py: {offenders}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
