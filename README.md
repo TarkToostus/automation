@@ -89,6 +89,8 @@ tark_cli tasks
 | `tark_cli wiki 123 set --section Brief --body "..."` | Upsert a wiki section (preferred — dup-safe) |
 | `tark_cli wiki 123 append --section Brief --body "..."` | Append; refuses if section already exists |
 | `tark_cli wiki 123 replace --section Brief --body "..."` | Replace existing section's body |
+| `tark_cli wiki 123 delete --section Brief` | Dry run: show what a delete would remove (exits non-zero) |
+| `tark_cli wiki 123 delete --section Brief --yes` | Remove the section — DESTRUCTIVE, needs a `pm:delete` PAT scope |
 | `tark_cli stage 123 work` | Advance task stage (server gates on wiki sections) |
 | `tark_cli update 123 --priority high --assignee 38` | PATCH common task fields |
 | `tark_cli ingest <project> <board> --tasks-file tasks.json` | Bulk-create tasks (dedupes by subject) |

@@ -73,6 +73,8 @@ Usage (binary installed as `tark_cli` at ~/bin/tark_cli; examples below use that
     tark_cli wiki <task-id> set     --section <h> --body <md>  # Upsert (preferred)
     tark_cli wiki <task-id> append  --section <h> --body <md>  # Append (refuses if dup)
     tark_cli wiki <task-id> replace --section <h> --body <md>  # Replace (404 if missing)
+    tark_cli wiki <task-id> delete  --section <h>              # Dry run: show what would go
+    tark_cli wiki <task-id> delete  --section <h> --yes        # Remove it (needs pm:delete scope)
     tark_cli wiki <task-id> put     --body <md>                # Replace whole wiki (PUT)
     tark_cli wiki <task-id> put     --from-file path/to.md     # Same, body read from file
     tark_cli wiki <task-id> put     --from-stdin               # Same, body read from stdin
@@ -178,6 +180,25 @@ def _get_user_id() -> int | None:
 # HTTP client (stdlib only)
 # ---------------------------------------------------------------------------
 
+# A 403 `detail` that NAMES a scope ("pm:delete scope required") is actionable on
+# its own. DRF's generic boilerplate ("You do not have permission to perform this
+# action.") is not, and must not swallow the path-derived hint.
+_SCOPE_IN_DETAIL_RE = re.compile(r'\b[a-z][a-z0-9_]*:[a-z][a-z0-9_]*\b')
+
+# Control + ANSI-escape bytes. Stripped before echoing SERVER-SUPPLIED text.
+_CONTROL_CHARS_RE = re.compile(r'[\x00-\x08\x0b-\x1f\x7f-\x9f]')
+
+
+def _sanitize_inline(text: str) -> str:
+    """Strip control/escape bytes from untrusted text before it hits a terminal.
+
+    Wiki content is attacker-controllable: a section title carrying an ESC byte
+    can repaint the screen, hide lines, or spoof a confirmation prompt. Printable
+    characters pass through verbatim.
+    """
+    return _CONTROL_CHARS_RE.sub('', text or '')
+
+
 def _request(method: str, path: str, body: dict | None = None, params: dict | None = None) -> dict | list:
     base = _get_url().rstrip('/')
     url = f'{base}{path}'
@@ -209,12 +230,28 @@ def _request(method: str, path: str, body: dict | None = None, params: dict | No
         if e.code == 401:
             _err('Authentication failed (401). Check your PAT token.')
         elif e.code == 403:
-            # Determine required scope from path
+            # A `detail` that NAMES a scope wins outright -- the path-derived guess
+            # below cannot tell pm:write from pm:delete, and telling someone to add
+            # the scope they already hold sends them in a circle (the wiki `delete`
+            # op returns {"detail": "pm:delete scope required"} while every other
+            # /pm/ write needs only pm:write). A GENERIC detail is DRF boilerplate
+            # ("You do not have permission to perform this action." -- what every
+            # missing-scope PATScope denial returns) and must NOT swallow the hint:
+            # print both, or the other 30-odd commands lose their only next step.
+            try:
+                payload = json.loads(body_text)
+            except (json.JSONDecodeError, ValueError):
+                payload = None
+            detail = payload.get('detail') if isinstance(payload, dict) else None
             scope_hint = ''
             if '/c2/' in path:
                 scope_hint = ' Add c2:read scope to your PAT.'
             elif '/pm/' in path:
                 scope_hint = ' Add pm:write scope to your PAT.'
+            if detail and _SCOPE_IN_DETAIL_RE.search(str(detail)):
+                _err(f'Permission denied (403): {_sanitize_inline(str(detail))}')
+            if detail:
+                _err(f'Permission denied (403): {_sanitize_inline(str(detail))}{scope_hint}')
             _err(f'Permission denied (403).{scope_hint}')
         elif e.code == 404:
             try:
@@ -1951,6 +1988,37 @@ def _wiki_section_exists(wiki_text: str, header: str) -> bool:
     return False
 
 
+def _wiki_exact_sections(wiki_text: str, header: str) -> list[tuple[int, int]]:
+    """(start, end) span of every `## {header}` block, EXACT title match.
+
+    The server runs TWO different matchers and they disagree. `_wiki_has_section`
+    (stage gates, and the mirror `_wiki_section_exists` above) is a PREFIX match:
+    header "Verify" hits "## Verify: Phase 1". `_wiki_delete_section` and
+    `_wiki_replace_section` compare the title VERBATIM. Preflighting a delete with
+    the prefix matcher would green-light "Verify" against a wiki that only has
+    "Verify: Phase 1", then eat a server 404. Destructive ops preflight with this.
+    """
+    text = wiki_text or ''
+    matches = list(_WIKI_HEADER_RE.finditer(text))
+    spans = []
+    for i, m in enumerate(matches):
+        if m.group('title').strip() == header:
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+            spans.append((m.start(), end))
+    return spans
+
+
+def _wiki_prefix_titles(wiki_text: str, header: str) -> list[str]:
+    """Titles that START with `header` but are not equal to it -- the near-misses
+    behind a failed exact-match delete ("Verify" vs "Verify: Phase 1")."""
+    seen = []
+    for m in _WIKI_HEADER_RE.finditer(wiki_text or ''):
+        title = m.group('title').strip()
+        if title != header and title.startswith(header) and title not in seen:
+            seen.append(title)
+    return seen
+
+
 # Cross-repo contract: these reason tags appear in shared fixture
 # (_tark/shared/wiki_recovery_cases.json) and the server-side mirror in
 # tark-platform `_recover_wiki_body`. Rename = drift = test failure.
@@ -2064,19 +2132,81 @@ def _resolve_body(args) -> str | None:
     return recovered
 
 
+def cmd_wiki_delete(args, path: str) -> None:
+    """Remove one `## Section` block. The only destructive wiki op.
+
+    Server contract (project_management crud.py): POST {action: 'delete', section}
+    removes the FIRST exact-title match and requires the `pm:delete` PAT scope --
+    every other wiki write needs only `pm:write`. Stage gates are forward-only, so
+    deleting a gate's evidence section does NOT revert `task.stage`.
+
+    Preflight is local and exact-match (`_wiki_exact_sections`), so a header that
+    only prefix-matches fails here with the near-misses named, instead of as an
+    opaque server 404. Without --yes the preflight prints what WOULD go and exits
+    non-zero -- that is the dry run.
+    """
+    if not args.section:
+        _err('delete: --section <header> is required')
+        return
+    header = args.section.strip().lstrip('#').strip()
+    if not header:
+        _err('delete: --section must name a header, not just "#"')
+        return
+
+    cur = _get(path)
+    wiki_text = cur.get('wiki', '') if isinstance(cur, dict) else ''
+    spans = _wiki_exact_sections(wiki_text, header)
+
+    if not spans:
+        # Titles come from the wiki, i.e. from another user -- sanitize before they
+        # reach a terminal. A title carrying an ESC byte would otherwise repaint the
+        # screen on a plain "header not found".
+        near = [_sanitize_inline(t) for t in _wiki_prefix_titles(wiki_text, header)]
+        hint = f' Closest headers: {", ".join(near)}.' if near else ''
+        _err(f'No section titled exactly "## {header}" on task #{args.task_id}.{hint}')
+        return
+
+    # Never echo the section body. A wiki is untrusted text and this preflight
+    # read is deliberately not routed through _safety_check_or_die -- report the
+    # size, not the content.
+    start, end = spans[0]
+    dupes = f', first of {len(spans)} copies' if len(spans) > 1 else ''
+    preview = f'  would remove "## {header}" from task #{args.task_id} ({end - start} chars{dupes})'
+    # stderr under --json: a preflight line on stdout would make the payload
+    # unparseable for anything piping this into jq. flush so the preview still
+    # lands ABOVE the unbuffered stderr warning/error when stdout is a pipe.
+    print(preview, file=sys.stderr if args.json else sys.stdout, flush=True)
+    if len(spans) > 1:
+        _warn(f'"## {header}" appears {len(spans)}x -- one delete removes ONE copy; re-run to remove the next.')
+
+    if not getattr(args, 'yes', False):
+        _err('delete is destructive and not undoable -- re-run with --yes to confirm.')
+        return
+
+    data = _post(path, {'action': 'delete', 'section': header})
+    if args.json:
+        _json_out(data)
+        return
+    remaining = data.get('wiki', '') if isinstance(data, dict) else ''
+    left = len(_wiki_exact_sections(remaining, header))
+    tail = f' ({left} cop{"y" if left == 1 else "ies"} of that header remain{"s" if left == 1 else ""})' if left else ''
+    print(f'  wiki delete OK on task #{args.task_id} section "{header}"{tail}')
+
+
 def cmd_wiki(args):
-    """Fetch / set / append / replace / put task wiki.
+    """Fetch / set / append / replace / delete / put task wiki.
 
     Actions:
         get      - fetch the markdown body (default)
         set      - upsert: replace if section exists, else append (preferred for /brief)
         append   - add a new `## Section` block; refuses if header already exists (use --force to override)
         replace  - overwrite an existing section's body; 404 if header missing
+        delete   - remove a `## Section` block. DESTRUCTIVE, needs --yes and a pm:delete PAT.
         put      - replace the WHOLE wiki body (no section). Use --body, --from-file, or --from-stdin.
 
     Body source for any write op: --body <md> > --from-file <path> > --from-stdin.
 
-    NOTE: section ops (set/append/replace) use POST with payload field `body`.
+    NOTE: section ops (set/append/replace/delete) use POST with payload field `body`.
     Whole-body put uses PUT with payload field `wiki`.
     """
     path = f'/api/v1/pat/pm/tasks/{args.task_id}/wiki/'
@@ -2096,8 +2226,12 @@ def cmd_wiki(args):
         print(wiki_body)
         return
 
-    if args.action not in ('set', 'append', 'replace', 'put'):
-        _err(f'Unknown wiki action "{args.action}". Use: get, set, append, replace, put')
+    if args.action not in ('set', 'append', 'replace', 'delete', 'put'):
+        _err(f'Unknown wiki action "{args.action}". Use: get, set, append, replace, delete, put')
+        return
+
+    if args.action == 'delete':
+        cmd_wiki_delete(args, path)
         return
 
     body_text = _resolve_body(args)
@@ -2123,10 +2257,19 @@ def cmd_wiki(args):
 
     # Pre-flight: GET current wiki for set/append safety checks.
     # (replace doesn't need this - server returns 404 with detail if missing.)
+    #
+    # EXACT match, not `_wiki_section_exists`. The upsert decision has to predict
+    # what the server's `replace` will do, and `_wiki_replace_section` compares
+    # titles verbatim while `_wiki_section_exists` mirrors the PREFIX matcher the
+    # stage gates use. On the prefix matcher, `set --section Verify` against a wiki
+    # holding only "## Verify: Phase 1" chose `replace`, and the server 404'd on a
+    # section the CLI had just reported as present -- an upsert that cannot upsert.
+    # Same for `append`, which refused as a duplicate a header that did not exist.
     if op in ('set', 'append'):
         cur = _get(path)
         wiki_text = cur.get('wiki', '') if isinstance(cur, dict) else ''
-        exists = _wiki_section_exists(wiki_text, args.section)
+        header = args.section.strip().lstrip('#').strip()
+        exists = bool(_wiki_exact_sections(wiki_text, header))
         if op == 'set':
             op = 'replace' if exists else 'append'
         elif op == 'append' and exists and not getattr(args, 'force', False):
@@ -3046,15 +3189,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--tasks', help='Tasks as JSON array string')
     p.add_argument('--tasks-file', help='Path to JSON file containing the tasks array')
 
-    # wiki <task-id> [get|set|append|replace|put] [--section H] [--body MD|--from-file P|--from-stdin] [--force]
-    p = sub.add_parser('wiki', help='Task wiki get/set/append/replace/put (sections via POST `body`; whole body via PUT `wiki`)')
+    # wiki <task-id> [get|set|append|replace|delete|put] [--section H] [--body MD|--from-file P|--from-stdin] [--force] [--yes]
+    p = sub.add_parser('wiki', help='Task wiki get/set/append/replace/delete/put (sections via POST `body`; whole body via PUT `wiki`)')
     p.add_argument('task_id', type=int, help='Task ID')
-    p.add_argument('action', nargs='?', choices=['get', 'set', 'append', 'replace', 'put'], help='Default: get. `set` upserts a section; `put` replaces the whole wiki.')
-    p.add_argument('--section', help='Section header (without leading "## "). Required for set/append/replace; ignored for put.')
+    p.add_argument('action', nargs='?', choices=['get', 'set', 'append', 'replace', 'delete', 'put'], help='Default: get. `set` upserts a section; `delete` removes one; `put` replaces the whole wiki.')
+    p.add_argument('--section', help='Section header (without leading "## "). Required for set/append/replace/delete; ignored for put.')
     p.add_argument('--body', help='Markdown body (literal). Use --from-file or --from-stdin for large content.')
     p.add_argument('--from-file', dest='from_file', help='Read body from a file path')
     p.add_argument('--from-stdin', dest='from_stdin', action='store_true', help='Read body from stdin (useful for piping)')
     p.add_argument('--force', action='store_true', help='Allow `append` to create a duplicate of an existing section')
+    p.add_argument('--yes', '-y', action='store_true', help='Confirm a destructive `delete`. Without it, delete is a dry run.')
 
     # stage <task-id> <stage>
     p = sub.add_parser('stage', help='Advance task stage (gates on wiki section)')
