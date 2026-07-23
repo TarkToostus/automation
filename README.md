@@ -94,6 +94,7 @@ tark_cli tasks
 | `tark_cli ingest <project> <board> --tasks-file tasks.json` | Bulk-create tasks (dedupes by subject) |
 | `tark_cli api <path>` | Generic GET against any `/api/v1/pat/<path>/` endpoint |
 | `tark_cli api <path> --post '{...}'` / `--patch '{...}'` | Generic POST / PATCH escape hatch |
+| `tark_cli api "pm/tasks/?board=48&page=2"` | Inline query string; merges with `--filter` (flag wins on key clash) |
 
 Run `tark_cli --help` for the full list, or `tark_cli <command> --help` for flags.
 

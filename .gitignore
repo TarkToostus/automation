@@ -16,3 +16,6 @@ venv/
 *.swp
 .DS_Store
 templates/
+
+# Verification artifacts (screenshots, transcripts)
+.proof/
