@@ -114,6 +114,7 @@ try:
 except ImportError:
     _sc = None
 from pathlib import Path
+from typing import NoReturn
 
 # ---------------------------------------------------------------------------
 # Config
@@ -730,7 +731,9 @@ def _safety_check_or_die(mode: str, title: str, body: str, force: bool) -> None:
 # Output helpers
 # ---------------------------------------------------------------------------
 
-def _err(msg: str) -> None:
+def _err(msg: str) -> NoReturn:
+    """Print to stderr and EXIT. Annotated NoReturn so callers can rely on that:
+    a guard that ends in `_err(...)` never falls through to the code below it."""
     print(f'Error: {msg}', file=sys.stderr)
     sys.exit(1)
 
@@ -2559,18 +2562,58 @@ def _make_detail_cmd(prefix: str, label: str):
 # Commands: Generic - `api` escape hatch for any PAT endpoint
 # ---------------------------------------------------------------------------
 
+def _api_path(raw_path: str, filters: list[str] | None) -> str:
+    """Build `/api/v1/pat/<path>/?<query>` from a path that MAY carry its own query.
+
+    The inline query must be split off BEFORE the canonical trailing slash is
+    appended. Formatting `<path>/<qs>` while `<path>` still holds `?board=48&page=2`
+    puts the slash AFTER the query, gluing it onto the LAST parameter's value:
+    `page=2/` -> 404 "Invalid page.", `page_size=1000/` -> the server rejects the
+    value and silently falls back to 50 rows, so a page-walk truncates while
+    looking successful. The slash belongs before the `?` - Django's APPEND_SLASH
+    resolves the endpoint on the path, never on the query.
+
+    Inline pairs and `--filter k=v` merge into ONE query string, so every value is
+    percent-encoded exactly once (parse_qsl decodes, urlencode re-encodes).
+    Repeated inline keys are PRESERVED (`?tag=a&tag=b` sends both) - the old
+    pass-through sent both, and django_filters' `in`/multiple-choice filters read
+    them. `--filter` stays last-wins per its existing contract, and a `--filter`
+    key REPLACES every inline pair of that name, being the more explicit of the two.
+    """
+    split = urllib.parse.urlsplit(raw_path)
+    # Fail loud on every shape that would silently produce a URL the caller did not
+    # ask for. Each of these used to sail through and hit a wrong (or no) endpoint.
+    if split.scheme or split.netloc:
+        _err('Pass a path suffix, not a full URL: "pm/tasks/?board=48", '
+             'not "https://host/api/v1/pat/pm/tasks/?board=48".')
+    if split.fragment:
+        _err('Path must not contain a "#" fragment - the server never receives it.')
+    path = split.path.strip('/')
+    if not path:
+        _err('Path is empty. Give an endpoint, e.g. "pm/tasks/" or "sales/leads".')
+    if '..' in path.split('/'):
+        _err(f'Path must stay under /api/v1/pat/ - ".." segments escape it: {path!r}')
+
+    pairs = urllib.parse.parse_qsl(split.query, keep_blank_values=True)
+    overrides: dict[str, str] = {}
+    for kv in (filters or []):
+        if '=' not in kv:
+            _err(f'--filter needs k=v, got {kv!r}. A bare flag would be dropped silently.')
+        k, v = kv.split('=', 1)
+        overrides[k] = v
+    merged = [(k, v) for k, v in pairs if k not in overrides] + list(overrides.items())
+
+    qs = ('?' + urllib.parse.urlencode(merged)) if merged else ''
+    return f'/api/v1/pat/{path}/{qs}'
+
+
 def cmd_api(args):
     """Generic GET/POST/PATCH against /api/v1/pat/<path>/.
 
     Escape hatch for endpoints that don't yet have a named command. When you
     reach for this repeatedly for the same endpoint, add a named command.
     """
-    path = args.path.strip('/')
-    params = {}
-    for kv in (args.filter or []):
-        if '=' in kv:
-            k, v = kv.split('=', 1)
-            params[k] = v
+    path = _api_path(args.path, args.filter)
 
     body = None
     method = 'GET'
@@ -2586,8 +2629,7 @@ def cmd_api(args):
             _err(f'Invalid JSON for --{method.lower()}: {e}')
             return
 
-    qs = ('?' + urllib.parse.urlencode(params)) if params else ''
-    result = _request(method, f'/api/v1/pat/{path}/{qs}', body=body)
+    result = _request(method, path, body=body)
     _json_out(result)
 
 
@@ -3118,8 +3160,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     # generic api escape hatch
     p = sub.add_parser('api', help='Generic request to /api/v1/pat/<path>/')
-    p.add_argument('path', help='Path suffix after /api/v1/pat/ (e.g. sales/leads)')
-    p.add_argument('--filter', '-f', action='append', help='Query filter k=v (repeatable)')
+    p.add_argument('path', help='Path suffix after /api/v1/pat/ (e.g. sales/leads). '
+                                'May carry an inline query: "pm/tasks/?board=48&page=2"')
+    p.add_argument('--filter', '-f', action='append',
+                   help='Query filter k=v (repeatable). Merges with an inline query; wins on key clash')
     p.add_argument('--post', help='POST body (JSON string)')
     p.add_argument('--patch', help='PATCH body (JSON string). Use path like "pm/tasks/123"')
 
