@@ -13,7 +13,7 @@ runs `git commit` / `gh pr` (the deliberate content-ops-only boundary).
     website from-proof TASK [--page R]     # reuse /verify .proof shots as help step shots
                        [--dest DIR] [--no-article] [--build] [--sync]
     website persist-proof TASK --page R --dest DIR   # copy+rename shots only (/pr Step 7b step a)
-    website release-note --date D          # scaffold a docu/help/releases/ entry DRAFT (+ee mirror)
+    website release-note --date D          # scaffold a docu/help/releases/ entry DRAFT (+et mirror)
                        [--tasks ID,ID] [--slugs module/slug,...]
     website refresh [--from-proof TASK --page R] [--clean]
                     [--skip-capture] [--skip-build] [--skip-website] [--commit] [--push]
@@ -266,7 +266,7 @@ def _wiki_help_slug(task_id):
 
 
 def resolve_release_item(repo, spec):
-    """Resolve a 'module/slug' or a verified '/route' to (module, slug, en_title, ee_title, path).
+    """Resolve a 'module/slug' or a verified '/route' to (module, slug, en_title, et_title, path).
 
     Returns None when it cannot map to an existing article (caller [WARN]s and
     skips, same failure class from-proof already flags). A leading '/' is run
@@ -292,13 +292,15 @@ def resolve_release_item(repo, spec):
         if not art.exists():
             return None
     en_title = parse_frontmatter(art).get("title") or slug.replace("-", " ").title()
-    # Prefer the Estonian article title for the ee mirror (build-help.py overlay
-    # convention: docu/help/<module>/ee/<slug>.md); fall back to the en title.
-    ee_art = repo / "docu" / "help" / module / "ee" / f"{slug}.md"
-    ee_title = en_title
-    if ee_art.exists():
-        ee_title = parse_frontmatter(ee_art).get("title") or en_title
-    return module, slug, en_title, ee_title, art
+    # Prefer the Estonian article title for the et mirror (build-help.py overlay
+    # convention: docu/help/<module>/et/<slug>.md); fall back to the en title.
+    # Estonian is `et`, not `ee` — tark-platform PR #969 (2026-07-23) moved every
+    # docu/help/<module>/ee/ dir to .../et/ and build-help.py reads LOCALES=('en','et').
+    et_art = repo / "docu" / "help" / module / "et" / f"{slug}.md"
+    et_title = en_title
+    if et_art.exists():
+        et_title = parse_frontmatter(et_art).get("title") or en_title
+    return module, slug, en_title, et_title, art
 
 
 RELEASE_TEMPLATE = """---
@@ -311,7 +313,7 @@ order: {order}
 > TODO curate: replace with customer-facing prose. Bullets are auto-generated
 > links; the wording is a curation pass — draft the factual bullets, then run
 > the codex polish (`codex exec -m gpt-5.5`, see /help-center §Rollout step 2)
-> for natural full-sentence en+ee copy. Never ship this template text.
+> for natural full-sentence en+et copy. Never ship this template text.
 
 ## {heading}
 
@@ -359,7 +361,7 @@ def cmd_release_note(args):
     for spec in [s.strip() for s in (args.slugs or "").split(",") if s.strip()]:
         specs.append((f"slug {spec}", spec))
 
-    resolved = []  # (module, slug, en_title, ee_title)
+    resolved = []  # (module, slug, en_title, et_title)
     seen = set()   # dedupe by (module, slug), preserve first-seen order
     modules = []   # union, first-seen order
     for label, spec in specs:
@@ -367,11 +369,11 @@ def cmd_release_note(args):
         if not item:
             print(f"[WARN] {label}: '{spec}' matched no help article under docu/help/ — skipping")
             continue
-        module, slug, en_title, ee_title, _ = item
+        module, slug, en_title, et_title, _ = item
         if (module, slug) in seen:
             continue
         seen.add((module, slug))
-        resolved.append((module, slug, en_title, ee_title))
+        resolved.append((module, slug, en_title, et_title))
         if module not in modules:
             modules.append(module)
 
@@ -383,20 +385,22 @@ def cmd_release_note(args):
     order = -int(date.replace("-", ""))  # newest-first under ascending sort
     rel_dir = repo / "docu" / "help" / "releases"
 
-    # ee pattern keeps the article title nominative ("Vaata [title]" is wrong
+    # et pattern keeps the article title nominative ("Vaata [title]" is wrong
     # case government — vaadata governs partitive; a colon lead-in avoids it).
-    en_bullets = [f"- See [{en_t}](/help-center/{m}/{s})." for m, s, en_t, ee_t in resolved]
-    ee_bullets = [f"- Loe lähemalt: [{ee_t}](/help-center/{m}/{s})." for m, s, en_t, ee_t in resolved]
+    en_bullets = [f"- See [{en_t}](/help-center/{m}/{s})." for m, s, en_t, et_t in resolved]
+    et_bullets = [f"- Loe lähemalt: [{et_t}](/help-center/{m}/{s})." for m, s, en_t, et_t in resolved]
 
     en_path = rel_dir / f"{date}-{primary_slug}.md"
-    ee_path = rel_dir / "ee" / f"{date}-{primary_slug}.md"
+    # `et`, not `ee` — build-help.py reads LOCALES=('en','et'); an entry written to
+    # releases/ee/ is scaffolded, committed, and then never published (tark-platform #969).
+    et_path = rel_dir / "et" / f"{date}-{primary_slug}.md"
 
     en_state = _write_release(en_path, f"Release {date}", date, modules, order,
                               "Highlights", en_bullets)
-    ee_state = _write_release(ee_path, f"Uuendused {date}", date, modules, order,
-                              "Uuendused", ee_bullets)
+    et_state = _write_release(et_path, f"Uuendused {date}", date, modules, order,
+                              "Uuendused", et_bullets)
 
-    for state, path in ((en_state, en_path), (ee_state, ee_path)):
+    for state, path in ((en_state, en_path), (et_state, et_path)):
         tag = "[OK]" if state == "created" else "[exists]"
         verb = "scaffolded" if state == "created" else "left as-is"
         print(f"{tag} {verb}: {path.relative_to(repo)}")
@@ -572,7 +576,7 @@ def build_parser():
     s.add_argument("--proof-dir", dest="proof_dir", help="explicit .proof screenshots dir override")
     s.set_defaults(func=cmd_persist_proof)
 
-    s = sub.add_parser("release-note", help="scaffold a docu/help/releases/ entry DRAFT (+ee) from tasks/slugs")
+    s = sub.add_parser("release-note", help="scaffold a docu/help/releases/ entry DRAFT (+et) from tasks/slugs")
     s.add_argument("--date", required=True, help="release date, YYYY-MM-DD (day-grain; drives filename + order)")
     s.add_argument("--tasks", help="C2 task ids (comma-separated); slug read from each task's wiki 'Help Article' section")
     s.add_argument("--slugs", help="help-article specs (comma-separated), each 'module/slug' or a verified '/route'")
