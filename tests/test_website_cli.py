@@ -24,16 +24,16 @@ import website_cli
 
 
 def _make_fake_repo(root: Path) -> Path:
-    """Minimal tark-platform-shaped checkout: build-help.py + one en/ee article."""
+    """Minimal tark-platform-shaped checkout: build-help.py + one en/et article."""
     (root / "scripts").mkdir(parents=True)
     (root / "scripts" / "build-help.py").write_text("# stub\n", encoding="utf-8")
     core = root / "docu" / "help" / "core"
-    (core / "ee").mkdir(parents=True)
+    (core / "et").mkdir(parents=True)
     (core / "time-tracking.md").write_text(
         '---\ntitle: "Time Tracking"\npage: "/workforce/time-tracking"\norder: 1\n---\n\nbody\n',
         encoding="utf-8",
     )
-    (core / "ee" / "time-tracking.md").write_text(
+    (core / "et" / "time-tracking.md").write_text(
         '---\ntitle: "Ajajälgimine"\npage: "/workforce/time-tracking"\norder: 1\n---\n\nkeha\n',
         encoding="utf-8",
     )
@@ -46,7 +46,7 @@ class ReleaseNoteScaffoldTest(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.repo = _make_fake_repo(Path(tmp.name))
         self.en_path = self.repo / "docu" / "help" / "releases" / "2099-01-02-time-tracking.md"
-        self.ee_path = self.repo / "docu" / "help" / "releases" / "ee" / "2099-01-02-time-tracking.md"
+        self.et_path = self.repo / "docu" / "help" / "releases" / "et" / "2099-01-02-time-tracking.md"
 
     def _run(self):
         out = io.StringIO()
@@ -57,29 +57,29 @@ class ReleaseNoteScaffoldTest(unittest.TestCase):
             ])
         return rc, out.getvalue()
 
-    def test_scaffold_vocabulary_en_and_ee(self):
+    def test_scaffold_vocabulary_en_and_et(self):
         rc, out = self._run()
         self.assertEqual(rc, 0)
         en = self.en_path.read_text(encoding="utf-8")
-        ee = self.ee_path.read_text(encoding="utf-8")
+        et = self.et_path.read_text(encoding="utf-8")
 
-        # en surface: unchanged by the ee vocabulary decision
+        # en surface: unchanged by the et vocabulary decision
         self.assertIn('title: "Release 2099-01-02"', en)
         self.assertIn("## Highlights", en)
         self.assertIn("- See [Time Tracking](/help-center/core/time-tracking).", en)
 
-        # ee surface: Uuendused vocabulary, never Väljalase/Esiletõstetud
-        self.assertIn('title: "Uuendused 2099-01-02"', ee)
-        self.assertIn("## Uuendused", ee)
-        self.assertNotIn("Väljalase", ee)
-        self.assertNotIn("Esiletõstetud", ee)
+        # et surface: Uuendused vocabulary, never Väljalase/Esiletõstetud
+        self.assertIn('title: "Uuendused 2099-01-02"', et)
+        self.assertIn("## Uuendused", et)
+        self.assertNotIn("Väljalase", et)
+        self.assertNotIn("Esiletõstetud", et)
 
-        # ee bullet: colon lead-in keeps the title nominative; "Vaata [" banned
-        self.assertIn("- Loe lähemalt: [Ajajälgimine](/help-center/core/time-tracking).", ee)
-        self.assertNotIn("Vaata [", ee)
+        # et bullet: colon lead-in keeps the title nominative; "Vaata [" banned
+        self.assertIn("- Loe lähemalt: [Ajajälgimine](/help-center/core/time-tracking).", et)
+        self.assertNotIn("Vaata [", et)
 
         # both drafts + the console output point at the mandatory codex polish pass
-        for text in (en, ee, out):
+        for text in (en, et, out):
             self.assertIn("codex exec -m gpt-5.5", text)
             self.assertIn("/help-center", text)
 
