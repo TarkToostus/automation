@@ -2257,10 +2257,19 @@ def cmd_wiki(args):
 
     # Pre-flight: GET current wiki for set/append safety checks.
     # (replace doesn't need this - server returns 404 with detail if missing.)
+    #
+    # EXACT match, not `_wiki_section_exists`. The upsert decision has to predict
+    # what the server's `replace` will do, and `_wiki_replace_section` compares
+    # titles verbatim while `_wiki_section_exists` mirrors the PREFIX matcher the
+    # stage gates use. On the prefix matcher, `set --section Verify` against a wiki
+    # holding only "## Verify: Phase 1" chose `replace`, and the server 404'd on a
+    # section the CLI had just reported as present -- an upsert that cannot upsert.
+    # Same for `append`, which refused as a duplicate a header that did not exist.
     if op in ('set', 'append'):
         cur = _get(path)
         wiki_text = cur.get('wiki', '') if isinstance(cur, dict) else ''
-        exists = _wiki_section_exists(wiki_text, args.section)
+        header = args.section.strip().lstrip('#').strip()
+        exists = bool(_wiki_exact_sections(wiki_text, header))
         if op == 'set':
             op = 'replace' if exists else 'append'
         elif op == 'append' and exists and not getattr(args, 'force', False):

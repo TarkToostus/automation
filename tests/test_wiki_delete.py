@@ -233,3 +233,51 @@ class ScopeErrorSurfacing(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class UpsertUsesTheExactMatcher(unittest.TestCase):
+    """`set` must predict what the server's `replace` will do. `_wiki_replace_section`
+    compares titles verbatim; the prefix matcher the stage gates use said "Verify"
+    was present in a wiki holding only "## Verify: Phase 1", so `set` chose
+    `replace` and the server 404'd on a section the CLI had just reported present.
+    Hit live against c2-prelive on 2026-07-23 while writing this branch's own
+    evidence section."""
+
+    def _run_set(self, action, section, wiki, force=False):
+        posted = {}
+
+        def fake_get(path, **params):
+            return {'id': 9, 'wiki': wiki}
+
+        def fake_post(path, body):
+            posted['body'] = body
+            return {'id': 9, 'wiki': wiki}
+
+        args = Namespace(task_id=9, action=action, section=section, body='x', from_file=None,
+                         from_stdin=False, force=force, yes=False, json=False)
+        with mock.patch.object(tark_cli, '_get', fake_get), \
+             mock.patch.object(tark_cli, '_post', fake_post), \
+             mock.patch.object(sys, 'stdout', io.StringIO()), \
+             mock.patch.object(sys, 'stderr', io.StringIO()) as err:
+            try:
+                tark_cli.cmd_wiki(args)
+            except SystemExit:
+                pass
+        return posted.get('body'), err.getvalue()
+
+    def test_set_appends_when_only_a_prefix_sibling_exists(self):
+        body, _err = self._run_set('set', 'Verify', '## Verify: Phase 1\n\nevidence\n')
+        self.assertEqual(body['action'], 'append')
+
+    def test_set_replaces_on_a_real_exact_match(self):
+        body, _err = self._run_set('set', 'Verify', '## Verify\n\nevidence\n')
+        self.assertEqual(body['action'], 'replace')
+
+    def test_append_does_not_refuse_over_a_prefix_sibling(self):
+        body, _err = self._run_set('append', 'Verify', '## Verify: Phase 1\n\nevidence\n')
+        self.assertEqual(body['action'], 'append')
+
+    def test_append_still_refuses_a_real_duplicate(self):
+        body, err = self._run_set('append', 'Verify', '## Verify\n\nevidence\n')
+        self.assertIsNone(body)
+        self.assertIn('already exists', err)
