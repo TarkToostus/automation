@@ -68,34 +68,55 @@ def test_queue_sort_order_and_review_exclusion(monkeypatch):
         {
             "client": "Test",
             "document": "larger same-date invoice",
+            "value": "50 000 EUR",
+            "paid": "0 EUR",
             "amount": "50 000 EUR",
             "due": "soon",
             "due_iso": "2026-08-03",
+            "necessary": True,
+        },
+    )
+    monkeypatch.setitem(
+        ledger.INVOICE_LEDGER,
+        "DUE-SOON",
+        {
+            "client": "Test",
+            "document": "smaller same-date invoice",
+            "value": "22 400 EUR",
+            "paid": "0 EUR",
+            "amount": "22 400 EUR",
+            "due": "soon",
+            "due_iso": "2026-08-03",
+            "necessary": True,
         },
     )
     later = _card(1, "ARB-AKT2", score=9)
-    costly = _card(2, "ARB-AKT1", score=2, ac=4)
-    simple = _card(3, "ARB-AKT1", score=1, ac=2)
+    costly = _card(2, "DUE-SOON", score=2, ac=4)
+    simple = _card(3, "DUE-SOON", score=1, ac=2)
     larger_same_date = _card(8, "DUE-HIGH", score=1, ac=5)
     hek = _card(4, "HEK-TM", score=1)
     ion = _card(5, "ION-PILOT", score=99)
     none = _card(6, "NONE", score=100)
-    shipped = _card(7, "ARB-AKT1", column="Review", retired="SHIPPED to customer")
-    ordered = ledger.queue_cards(
-        [later, costly, simple, larger_same_date, hek, ion, none, shipped]
-    )
+    signed = _card(9, "ARB-AKT1", score=50)
+    shipped = _card(7, "DUE-SOON", column="Review", retired="SHIPPED to customer")
+    cards = [later, costly, simple, larger_same_date, hek, ion, none, signed, shipped]
+    ordered = ledger.queue_cards(cards)
     assert [card["id"] for card in ordered] == [
         simple["id"],
         larger_same_date["id"],
         costly["id"],
         later["id"],
-        hek["id"],
         ion["id"],
+        hek["id"],
+    ]
+    # A signed act and a NONE line carry no money: they are postponable, signed first.
+    assert [card["id"] for card in ledger.postponed_cards(cards)] == [
+        signed["id"],
         none["id"],
     ]
 
 
-def test_renderer_has_the_five_headings_in_order():
+def test_renderer_has_the_six_headings_in_order():
     text = ledger.render_markdown(
         {"title": "Fake", "projects": [9]},
         [_card(1, "NONE")],
@@ -103,8 +124,9 @@ def test_renderer_has_the_five_headings_in_order():
     )
     headings = [line for line in text.splitlines() if line.startswith("## ")]
     assert headings == [
-        "## Invoices",
-        "## Queue - deliver in this order",
+        "## Value",
+        "## Necessary to deliver - in this order",
+        "## Can be postponed",
         "## Shipped, awaiting customer acceptance",
         "## Needs the customer",
         "## Board state",

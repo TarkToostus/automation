@@ -24,115 +24,194 @@ CLIENTS = {
         "title": "Arensburg OU (Tark Aeg)",
         "projects": [9],
         "extra_cards": [7647, 8312],
+        "codes": ["ARB-AKT1", "ARB-AKT2", "ARB-WARRANTY", "ARB-MAINT"],
     },
-    "ionix": {"title": "Ionix Systems", "projects": [8], "extra_cards": []},
+    "ionix": {
+        "title": "Ionix Systems",
+        "projects": [8],
+        "extra_cards": [],
+        "codes": ["ION-PILOT"],
+    },
     "sigma-workmaster": {
         "title": "Sigma Polymer Group (WorkMaster)",
         "projects": [18],
         "extra_cards": [],
+        "codes": ["SIG-CONTRACT", "SIG-PERSONA", "SIG-ALLDEVICE"],
     },
     "hekotek": {
         "title": "Hekotek (Koskisen, Service)",
         "projects": [14, 16, 20],
         "extra_cards": [],
+        "codes": ["HEK-TM"],
     },
-    "akzo": {"title": "Akzo Nobel (Tark Kratt)", "projects": [13], "extra_cards": []},
+    "akzo": {
+        "title": "Akzo Nobel (Tark Kratt)",
+        "projects": [13],
+        "extra_cards": [],
+        "codes": ["AKZ-KRATT"],
+    },
     "bombay": {
         "title": "Bombay Group (pre-sales)",
         "projects": [29],
         "extra_cards": [],
+        "codes": ["PRESALES"],
     },
     "sofaservice": {
-        "title": "SofaService (onboarding)",
-        "projects": [7],
+        "title": "SofaService (Recipe project)",
+        "projects": [7, 30],
         "extra_cards": [],
+        "codes": ["SOF-RECIPE"],
+    },
+    "aimarcam": {
+        "title": "Aimarcam (Coop Estonia via Multiresult)",
+        "projects": [24],
+        "extra_cards": [],
+        "codes": ["AIM-PROJECT"],
     },
 }
 
 INVOICE_LEDGER = {
+    # value / paid are the owner's figures (2026-09-02); amount = what is still on the table.
+    # necessary=False lines are collected already or carry no money: their cards can be postponed.
     "ARB-AKT1": {
         "client": "Arensburg",
-        "document": "Uleandmise-vastuvotmise akt nr 1 (workforce)",
-        "amount": "22 400 EUR",
-        "due": "akt 31.07.2026, schedule 03.08.2026",
-        "due_iso": "2026-08-03",
+        "document": "Akt nr 1 (workforce) - SIGNED",
+        "value": "22 400 EUR",
+        "paid": "signed",
+        "amount": "0 EUR (signed)",
+        "due": "signed",
+        "due_iso": None,
+        "necessary": False,
     },
     "ARB-AKT2": {
         "client": "Arensburg",
-        "document": "Akt nr 2 (finance + management reporting)",
+        "document": "Akt nr 2 (finance + management reporting), unsigned",
+        "value": "6 000 EUR",
+        "paid": "0 EUR",
         "amount": "6 000 EUR",
         "due": "akt 15.09.2026, schedule 30.09.2026",
         "due_iso": "2026-09-30",
+        "necessary": True,
     },
     "ARB-WARRANTY": {
         "client": "Arensburg",
         "document": "12-month warranty on delivered scope",
+        "value": "0 EUR",
+        "paid": "-",
         "amount": "0 EUR",
         "due": "rolling",
         "due_iso": None,
+        "necessary": False,
     },
     "ARB-MAINT": {
         "client": "Arensburg",
         "document": "Lisaarendused maintenance fee",
+        "value": "150 EUR/month",
+        "paid": "-",
         "amount": "150 EUR/month",
         "due": "after akt 2",
         "due_iso": None,
+        "necessary": False,
     },
     "SIG-CONTRACT": {
         "client": "Sigma",
-        "document": "WorkMaster contract 34 200 EUR (~31 000 delivered)",
-        "amount": "~3 200 EUR remaining",
+        "document": "WorkMaster contract",
+        "value": "34 200 EUR",
+        "paid": "19 000 EUR",
+        "amount": "~15 200 EUR remaining",
         "due": "overdue",
         "due_iso": "2026-04-07",
+        "necessary": True,
     },
     "SIG-PERSONA": {
         "client": "Sigma",
         "document": "Persona integration (confirmed extra)",
+        "value": "900 EUR",
+        "paid": "0 EUR",
         "amount": "900 EUR",
         "due": "no date",
         "due_iso": None,
+        "necessary": True,
     },
     "SIG-ALLDEVICE": {
         "client": "Sigma",
         "document": "AllDevice CMMS (confirmed extra)",
+        "value": "500 EUR",
+        "paid": "0 EUR",
         "amount": "500 EUR",
         "due": "no date",
         "due_iso": None,
+        "necessary": True,
     },
     "ION-PILOT": {
         "client": "Ionix",
-        "document": "Digital Traveller pilot acceptance",
-        "amount": "unknown",
-        "due": "unknown",
+        "document": "Digital Traveller SaaS (pilot -> full acceptance)",
+        "value": "~1 500 EUR/month",
+        "paid": "0 EUR",
+        "amount": "~1 500 EUR/month",
+        "due": "on full acceptance",
         "due_iso": None,
+        "necessary": True,
+    },
+    "SOF-RECIPE": {
+        "client": "SofaService",
+        "document": "Recipe / production module project",
+        "value": "~8 000 EUR",
+        "paid": "unknown",
+        "amount": "~8 000 EUR",
+        "due": "no date",
+        "due_iso": None,
+        "necessary": True,
+    },
+    "AIM-PROJECT": {
+        "client": "Aimarcam",
+        "document": "Coop retail video search project (IP owner Multiresult)",
+        "value": "~25 000 EUR",
+        "paid": "unknown",
+        "amount": "~25 000 EUR",
+        "due": "no date",
+        "due_iso": None,
+        "necessary": True,
     },
     "HEK-TM": {
         "client": "Hekotek",
         "document": "time & materials, monthly hours",
+        "value": "hourly",
+        "paid": "monthly",
         "amount": "hourly",
         "due": "monthly",
         "due_iso": None,
+        "necessary": True,
     },
     "AKZ-KRATT": {
         "client": "Akzo",
         "document": "Tark Kratt contract",
+        "value": "unknown",
+        "paid": "unknown",
         "amount": "unknown",
         "due": "rolling",
         "due_iso": None,
+        "necessary": True,
     },
     "PRESALES": {
         "client": "-",
         "document": "pre-sales",
+        "value": "0 EUR",
+        "paid": "-",
         "amount": "0 EUR",
         "due": "-",
         "due_iso": None,
+        "necessary": False,
     },
     "NONE": {
         "client": "-",
-        "document": "blocks no invoice",
+        "document": "can be postponed",
+        "value": "0 EUR",
+        "paid": "-",
         "amount": "0 EUR",
         "due": "-",
         "due_iso": None,
+        "necessary": False,
     },
 }
 
@@ -146,14 +225,15 @@ OPEN_COLUMNS = {
     "REJECTED",
 }
 NO_DUE_ORDER = [
-    "HEK-TM",
+    "AIM-PROJECT",
+    "SOF-RECIPE",
     "ION-PILOT",
+    "HEK-TM",
     "AKZ-KRATT",
     "SIG-PERSONA",
     "SIG-ALLDEVICE",
-    "ARB-WARRANTY",
-    "ARB-MAINT",
 ]
+POSTPONE_ORDER = ["ARB-AKT1", "ARB-WARRANTY", "ARB-MAINT", "PRESALES", "NONE"]
 _SECTION_RE = re.compile(r"^## ([^\r\n]+?)\s*$", re.MULTILINE)
 _FIELD_RE = re.compile(r"^\s*([^:\n]+):\s*(.*?)\s*$", re.MULTILINE)
 
@@ -253,8 +333,24 @@ def amount_value(amount: str) -> int:
 
 def invoice_info(code: str) -> dict[str, Any]:
     return INVOICE_LEDGER.get(
-        code, {"client": "", "document": "", "amount": "", "due": "", "due_iso": None}
+        code,
+        {
+            "client": "",
+            "document": "",
+            "value": "",
+            "paid": "",
+            "amount": "",
+            "due": "",
+            "due_iso": None,
+            "necessary": False,
+        },
     )
+
+
+def is_necessary(card: dict[str, Any]) -> bool:
+    """True when the card's invoice line still has money to collect."""
+    code = str(card.get("invoice", {}).get("blocks", "UNSCORED"))
+    return bool(invoice_info(code).get("necessary"))
 
 
 def is_awaiting_acceptance(card: dict[str, Any]) -> bool:
@@ -286,11 +382,9 @@ def queue_sort_key(card: dict[str, Any]) -> tuple[Any, ...]:
         )
     if code in NO_DUE_ORDER:
         return (1, NO_DUE_ORDER.index(code), depth, -score_value, card_id)
-    if code == "PRESALES":
-        return (2, depth, -score_value, card_id)
-    if code == "NONE":
-        return (3, depth, -score_value, card_id)
-    return (4, depth, -score_value, card_id)
+    if code in POSTPONE_ORDER:
+        return (2, POSTPONE_ORDER.index(code), depth, -score_value, card_id)
+    return (3, depth, -score_value, card_id)
 
 
 def is_hour_bucket(card: dict[str, Any]) -> bool:
@@ -301,15 +395,26 @@ def is_hour_bucket(card: dict[str, Any]) -> bool:
     )
 
 
+def _deliverable(card: dict[str, Any]) -> bool:
+    return bool(
+        card.get("open")
+        and not is_awaiting_acceptance(card)
+        and not is_hour_bucket(card)
+    )
+
+
 def queue_cards(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Open cards that are necessary to collect a value, in delivery order."""
     return sorted(
-        (
-            card
-            for card in cards
-            if card.get("open")
-            and not is_awaiting_acceptance(card)
-            and not is_hour_bucket(card)
-        ),
+        (card for card in cards if _deliverable(card) and is_necessary(card)),
+        key=queue_sort_key,
+    )
+
+
+def postponed_cards(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Open cards whose invoice line is collected or carries no money."""
+    return sorted(
+        (card for card in cards if _deliverable(card) and not is_necessary(card)),
         key=queue_sort_key,
     )
 
@@ -472,26 +577,35 @@ def render_markdown(
         f"> Generated by `automation/delivery_ledger.py` from C2 projects {projects}. Do not hand-edit - re-run to refresh.",
         "> The board is the source of truth; this file is the on-disk mirror and backup of its delivery state.",
         "",
-        "## Invoices",
-        "| Code | Document | Amount | Due | Open cards | Simple (ac<=2) | Awaiting acceptance |",
-        "| --- | --- | --- | --- | ---: | ---: | ---: |",
+        "## Value",
+        "| Line | Document | Value | Paid | On the table | Due | Necessary | Postponable | Simple (ac<=2) | Awaiting acceptance |",
+        "| --- | --- | --- | --- | --- | --- | ---: | ---: | ---: | ---: |",
     ]
     queue = queue_cards(cards)
+    postponed = postponed_cards(cards)
     accepted = [
         card for card in cards if card.get("open") and is_awaiting_acceptance(card)
     ]
     counts = Counter(card["invoice"]["blocks"] for card in queue)
+    postponed_counts = Counter(card["invoice"]["blocks"] for card in postponed)
     simple_counts = Counter(
         card["invoice"]["blocks"] for card in queue if card.get("simple")
     )
     accepted_counts = Counter(card["invoice"]["blocks"] for card in accepted)
-    codes = [
+    own = list(client.get("codes", []))
+    codes = own + [
         code
         for code in INVOICE_LEDGER
-        if code != "NONE" and (counts[code] or accepted_counts[code])
+        if code != "NONE"
+        and code not in own
+        and (counts[code] or postponed_counts[code] or accepted_counts[code])
     ]
+    if postponed_counts["UNSCORED"]:
+        codes.append("UNSCORED")
     for code in codes + ["NONE"]:
         info = invoice_info(code)
+        if code == "UNSCORED":
+            info = dict(info, document="no ## Invoice section yet - score it")
         lines.append(
             "| "
             + " | ".join(
@@ -499,9 +613,12 @@ def render_markdown(
                 for value in (
                     code,
                     info["document"],
+                    info["value"],
+                    info["paid"],
                     info["amount"],
                     info["due"],
                     counts[code],
+                    postponed_counts[code],
                     simple_counts[code],
                     accepted_counts[code],
                 )
@@ -511,7 +628,7 @@ def render_markdown(
     lines.extend(
         [
             "",
-            "## Queue - deliver in this order",
+            "## Necessary to deliver - in this order",
             "| # | Card | Column | Prio | Blocks | Waits on | Gate | WSJF | ac | Subject |",
             "| ---: | --- | --- | --- | --- | --- | --- | ---: | ---: | --- |",
         ]
@@ -531,6 +648,36 @@ def render_markdown(
                     blocks,
                     ", ".join(f"#{b}" for b in card.get("waits_on", [])) or "-",
                     invoice["gate"],
+                    card["wsjf"].get("score")
+                    if card["wsjf"].get("score") is not None
+                    else "",
+                    card["wsjf"].get("attention_cost")
+                    if card["wsjf"].get("attention_cost") is not None
+                    else "",
+                    card.get("name", ""),
+                )
+            )
+            + " |"
+        )
+    lines.extend(
+        [
+            "",
+            "## Can be postponed",
+            "| # | Card | Column | Prio | Line | WSJF | ac | Subject |",
+            "| ---: | --- | --- | --- | --- | ---: | ---: | --- |",
+        ]
+    )
+    for index, card in enumerate(postponed, 1):
+        lines.append(
+            "| "
+            + " | ".join(
+                _table_cell(value)
+                for value in (
+                    index,
+                    _card_link(card),
+                    card.get("column_name", ""),
+                    card.get("priority", ""),
+                    card["invoice"]["blocks"],
                     card["wsjf"].get("score")
                     if card["wsjf"].get("score") is not None
                     else "",
