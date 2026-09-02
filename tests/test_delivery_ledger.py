@@ -20,7 +20,7 @@ def _card(card_id, code, score=1.0, ac=5, column="Work", retired=""):
         "simple": False,
     }
     info = ledger.invoice_info(code)
-    card["simple"] = bool(info.get("due_iso") and ac <= 2)
+    card["simple"] = bool(info.get("necessary") and ac <= 2)
     return card
 
 
@@ -96,16 +96,20 @@ def test_queue_sort_order_and_review_exclusion(monkeypatch):
     larger_same_date = _card(8, "DUE-HIGH", score=1, ac=5)
     hek = _card(4, "HEK-TM", score=1)
     ion = _card(5, "ION-PILOT", score=99)
+    ion_simple = _card(10, "ION-PILOT", score=3, ac=2)
     none = _card(6, "NONE", score=100)
     signed = _card(9, "ARB-AKT1", score=50)
     shipped = _card(7, "DUE-SOON", column="Review", retired="SHIPPED to customer")
-    cards = [later, costly, simple, larger_same_date, hek, ion, none, signed, shipped]
+    cards = [
+        later, costly, simple, larger_same_date, hek, ion, ion_simple, none, signed, shipped
+    ]
     ordered = ledger.queue_cards(cards)
     assert [card["id"] for card in ordered] == [
         simple["id"],
         larger_same_date["id"],
         costly["id"],
         later["id"],
+        ion_simple["id"],
         ion["id"],
         hek["id"],
     ]

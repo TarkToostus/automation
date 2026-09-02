@@ -381,7 +381,15 @@ def queue_sort_key(card: dict[str, Any]) -> tuple[Any, ...]:
             card_id,
         )
     if code in NO_DUE_ORDER:
-        return (1, NO_DUE_ORDER.index(code), depth, -score_value, card_id)
+        simple = bool(card.get("simple"))
+        return (
+            1,
+            NO_DUE_ORDER.index(code),
+            depth,
+            0 if simple else 1,
+            -score_value,
+            card_id,
+        )
     if code in POSTPONE_ORDER:
         return (2, POSTPONE_ORDER.index(code), depth, -score_value, card_id)
     return (3, depth, -score_value, card_id)
@@ -474,8 +482,9 @@ def _parse_card(row: dict[str, Any], wiki: str | None = None) -> dict[str, Any]:
     card["open"] = str(card.get("column_name", "")).upper() not in OPEN_COLUMNS
     card["project_id"] = _project_from_card(card, int(card.get("project_id", 0) or 0))
     attention_cost = card["wsjf"].get("attention_cost")
+    # "Otherwise simple, but necessary" floats to the top of its line, dated or not.
     card["simple"] = bool(
-        invoice_info(card["invoice"]["blocks"]).get("due_iso")
+        invoice_info(card["invoice"]["blocks"]).get("necessary")
         and attention_cost is not None
         and int(attention_cost) <= 2
     )
