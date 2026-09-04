@@ -8,6 +8,10 @@ Authenticates against any Tark deployment using a Personal Access Token (PAT). S
 > you researching prospects and firing leads with **zero developer setup** (no git,
 > Homebrew, or Xcode). Easiest path: open **https://claude.ai/code** and pick this repo.
 
+> **Repo scope:** `tark_cli.py`, `sales_followup.py`, `ONBOARDING.md`, and `PROMPTS.md` are
+> the customer-facing tools this README covers. Other root scripts (`website_cli.py`,
+> `c2_auto.py`, `log_analyzer.py`, `sentry_warmup.py`) are internal maintainer tooling.
+
 ## Quickstart
 
 You only need **Python 3** (stdlib only — no `pip install`). `git` is optional.
@@ -69,11 +73,16 @@ tark_cli tasks
 | `tark_cli time-update <id> --hours 2.5 --description "..."` | Patch a time entry (sparse, needs `pm:write`) |
 | `tark_cli task-delete <id> [--yes]` | Delete a task (needs `pm:delete`, **destructive** - confirms unless `--yes`) |
 | `tark_cli time-delete <id> [--yes]` | Delete a time entry (needs `pm:write`, **destructive**) |
-| `tark_cli sites-active --domains a.tt.ee,b.tt.ee [--window 15m]` | Sites active-now (needs `c2:read`) |
+| `tark_cli sites-active --domains a.example.com,b.example.com [--window 15m]` | Sites active-now (needs `c2:read`) |
 | `tark_cli contract-blocks` | List contract blocks (system, `sales:read`) |
 | `tark_cli <lead\|offer\|offer-line\|contract\|pipeline\|pipeline-stage\|email-task> <id>` | Retrieve one sales record by ID |
 | `tark_cli <client\|user\|contract-type\|contract-block\|contract-template\|column> <id>` | Retrieve one system/PM record by ID |
 | `tark_cli offer-line-delete <id> [--yes]` | Delete an offer line (needs `sales:write`, **destructive**) |
+
+## Common Commands — Sales, Wiki & API
+
+| Command | What it does |
+|---------|-------------|
 | `tark_cli leads` / `offers` / `contracts` | Browse CRM |
 | `tark_cli leads create --title "Acme retrofit" --company "Acme OÜ" --pipeline Imports --source COLD` | Create a lead (needs `sales:write` PAT) |
 | `tark_cli leads-update <id> --status QUALIFIED --pipeline-stage 4` | Patch a lead (sparse, only sends given flags) |
@@ -184,6 +193,7 @@ See [`examples/`](examples/) for runnable scripts:
 - `03_timer.sh` — start/stop a timer around a unit of work
 - `04_batch_ingest.sh` — bulk-create tasks from a JSON file (idempotent)
 - `05_weekly_report.sh` — time totals grouped by project, for invoicing
+- `06_followup_draft.sh` — draft a sales follow-up email for a due lead
 
 ## Security
 
