@@ -2,7 +2,7 @@
 
 No network: `tark_cli._request` is mocked and the path it receives is captured.
 
-**The bug these pin (2026-07-23).** `cmd_api` built its URL as
+**The bug these pin.** `cmd_api` built its URL as
 `f'/api/v1/pat/{path}/{qs}'` after only `args.path.strip('/')`. `strip('/')` trims
 the ends of the WHOLE string, so a path carrying an inline query
 (`pm/tasks/?board=48&page=2` - the documented escape-hatch form) kept its `?...`
@@ -14,7 +14,7 @@ the LAST parameter's value:
 
 The second form is the dangerous one: the request succeeds, so a page-walk
 truncates while looking healthy and the caller concludes the data set is smaller
-than it is (board 48 returned 50 of 745 rows). The corruption was visible in the
+than it is (a board returned 50 of 745 rows). The corruption was visible in the
 server's echoed `next` URL as `&page_size=1000%2F`. Appending a throwaway last
 param (`&_=x`) made the slash land on the dummy - the workaround that proved it.
 

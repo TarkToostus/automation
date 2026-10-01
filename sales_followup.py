@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""sales_followup.py — gate-safe drafting for the sales follow-up engine (Feat #4600).
+"""sales_followup.py — gate-safe drafting for the sales follow-up engine.
 
-The follow-up engine (tark-platform sales module) is a first-class EmailTask:
+The follow-up engine (Tark sales module) is a first-class EmailTask:
 
     DRAFT     (queued)        <- `tark_cli followups-check` creates these
     REVIEW    (draft ready)   <- THIS script moves emails here after writing the body

@@ -5,17 +5,11 @@ tark - CLI for the Tark Platform.
 Standalone Python script (stdlib only, no pip deps).
 Authenticates via PAT token against the Tark API.
 
-INVARIANT - every PAT-exposed API endpoint must have a CLI command.
-    When you add or extend a resource in any `backend/*/api/pat_urls.py`,
-    also add/update the matching `cmd_*` handler here. The generic
-    `api <path>` command is the escape hatch for unreleased endpoints,
-    not an excuse to skip named commands.
+INVARIANT - every customer-facing PAT endpoint must have a CLI command.
+    The generic `api <path>` command is the escape hatch for endpoints
+    that do not have a named command yet.
 
-Usage (binary installed as `tark_cli` at ~/bin/tark_cli; examples below use that form):
-    tark_cli status                         # Deployment overview
-    tark_cli deployments                    # List deployments
-    tark_cli deploy <id|domain>             # Deployment detail
-
+Usage (examples assume `tark_cli` is on your PATH, e.g. a symlink to tark_cli.py):
     tark_cli tasks [--project=X] [--status=X]   # List tasks
     tark_cli task <id>                          # Task detail
     tark_cli create <project> <subject>         # Create task
@@ -62,7 +56,6 @@ Usage (binary installed as `tark_cli` at ~/bin/tark_cli; examples below use that
     tark_cli contract-types                 # Contract types (system)
     tark_cli contract-templates             # Contract templates (system)
     tark_cli contract-blocks                # Contract blocks (system)
-    tark_cli sites-active --domains a,b     # sites active-now (c2:read)
     tark_cli clients [--search=X]           # Tenant clients
 
     # Detail (retrieve) by ID - one per PAT resource that allows retrieve:
@@ -244,9 +237,7 @@ def _request(method: str, path: str, body: dict | None = None, params: dict | No
                 payload = None
             detail = payload.get('detail') if isinstance(payload, dict) else None
             scope_hint = ''
-            if '/c2/' in path:
-                scope_hint = ' Add c2:read scope to your PAT.'
-            elif '/pm/' in path:
+            if '/pm/' in path:
                 scope_hint = ' Add pm:write scope to your PAT.'
             if detail and _SCOPE_IN_DETAIL_RE.search(str(detail)):
                 _err(f'Permission denied (403): {_sanitize_inline(str(detail))}')
@@ -369,8 +360,8 @@ def _resolve_login(args) -> tuple[str, str]:
 
     Username: --user > config `user` key > interactive prompt.
     Password: $TARK_PASSWORD > getpass prompt. NEVER read from or written to any
-    file - the env var is the automation escape hatch (repo convention: secrets
-    live in ~/.tark-secrets.env, never inlined).
+    file - the env var is the automation escape hatch (keep it in your shell's
+    secret store, never inline it in a script).
     """
     username = getattr(args, 'user', None) or _load_config().get('user', '')
     if not username:
@@ -411,13 +402,12 @@ def _confirm_destructive(action_desc: str, assume_yes: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Static scope -> capability map. Derived from the four backend pat_urls.py
-# files; documents "what the PAT enables" offline and is the fallback for
+# Static scope -> capability map. Mirrors the server's PAT endpoints;
+# documents "what the PAT enables" offline and is the fallback for
 # `tokens scopes` when no login credentials are available.
 # ---------------------------------------------------------------------------
 
 _SCOPE_CAPABILITIES = {
-    'c2:read':     'Read deployments + sites active-now',
     'pm:read':     'Read PM projects, boards, columns, tasks, comments, time entries',
     'pm:write':    'Create/update PM tasks, comments, boards, columns, projects, timers, time entries',
     'pm:delete':   'Delete PM tasks',
@@ -446,7 +436,7 @@ _SAFETY_PROMPT = (
 # `OSError: [Errno 7] Argument list too long` and killed the whole chain before any
 # provider could answer -- a crash, not a verdict. Callers that hit this path exit
 # non-zero, and every gate that reads a failed fetch as "nothing to enforce" then
-# passed on nothing (C2 #9139: a 1.38 MB card wiki cleared the DoD gate vacuously).
+# passed on nothing (a very large task wiki could clear a stage gate vacuously).
 # The cap matches the one `cmd_wiki` already applied to its non-string branch --
 # one convention, applied centrally so no caller can route around it.
 # Bound of what this trades away: only the FIRST 8000 chars are screened, so
@@ -552,7 +542,7 @@ def _gemini_quota_probe_set(stderr_text: str) -> None:
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         # Write tmp + atomic rename: POSIX guarantees rename atomicity on the
-        # same filesystem, so concurrent daemon workers/CLI invocations either
+        # same filesystem, so concurrent CLI invocations either
         # see the prior marker or the new one - never a partial value.
         tmp = p.with_suffix(p.suffix + '.tmp')
         tmp.write_text(f'{until:.0f}\n')
@@ -589,7 +579,7 @@ def _safety_subprocess_env() -> dict[str, str]:
 def _provider_gemini(prompt: str, payload: str, timeout: int) -> tuple[str | None, str]:
     # The Google slot of the chain. The legacy `gemini` CLI retired 2026-06-18
     # for individual tiers; GEMINI_BIN (default 'agy', the Antigravity CLI)
-    # selects the binary, mirroring orchestrator/runners/proof/gemini_verifier.py.
+    # selects the binary.
     bin_ = os.environ.get('GEMINI_BIN', 'agy')
     if bin_ == 'gemini':
         # Enterprise Gemini Code Assist: legacy CLI honors -m + payload on stdin.
@@ -835,8 +825,8 @@ def _table(headers: list[str], rows: list[list], widths: list[int] | None = None
 
 def _ago(iso_str: str | None) -> str:
     """Legacy relative-time. Strips tz before comparing to utcnow - drifts by
-    local-tz offset. Kept for the 4 existing callers (last_seen / last_used /
-    started timer) where the drift hasn't bitten anyone yet. New code: use
+    local-tz offset. Kept for the existing callers (last_used / started timer)
+    where the drift hasn't bitten anyone yet. New code: use
     _ago_aware which round-trips timezones correctly via fromisoformat."""
     if not iso_str:
         return 'never'
@@ -874,8 +864,8 @@ def _ago(iso_str: str | None) -> str:
 
 
 def _ago_aware(iso_str: str | None) -> str:
-    """tz-aware relative time. Use this for fresh code (e.g. sidecar tracking
-    where seconds matter and the daemon emits +HH:MM offsets)."""
+    """tz-aware relative time. Use this for fresh code (e.g. task tracking
+    fields where seconds matter and timestamps carry +HH:MM offsets)."""
     if not iso_str:
         return 'never'
     try:
@@ -920,70 +910,6 @@ def _month_start() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Commands: Deployments
-# ---------------------------------------------------------------------------
-
-def cmd_status(args):
-    """Deployment grid summary."""
-    data = _get('/api/v1/pat/c2/deployments/')
-    results = data.get('results', data) if isinstance(data, dict) else data
-
-    if args.json:
-        _json_out(results)
-        return
-
-    print(f'\n  TARK DEPLOYMENTS ({len(results)})\n')
-    rows = []
-    for d in results:
-        healthy = 'OK' if d.get('is_healthy') else 'DOWN'
-        rows.append([
-            d.get('id', ''),
-            d.get('name', ''),
-            d.get('domain', ''),
-            d.get('environment_type', ''),
-            healthy,
-            _ago(d.get('last_seen')),
-        ])
-    _table(['ID', 'Name', 'Domain', 'Env', 'Health', 'Last Seen'], rows)
-    print()
-
-
-def cmd_deployments(args):
-    """List deployments (alias for status)."""
-    cmd_status(args)
-
-
-def cmd_deploy(args):
-    """Deployment detail."""
-    ident = args.identifier
-
-    # Try numeric ID first
-    try:
-        dep_id = int(ident)
-        data = _get(f'/api/v1/pat/c2/deployments/{dep_id}/')
-    except ValueError:
-        # Search by domain
-        all_deps = _get('/api/v1/pat/c2/deployments/')
-        results = all_deps.get('results', all_deps) if isinstance(all_deps, dict) else all_deps
-        match = [d for d in results if ident in d.get('domain', '')]
-        if not match:
-            _err(f'No deployment matching "{ident}"')
-        data = match[0]
-
-    if args.json:
-        _json_out(data)
-        return
-
-    print(f'\n  {data.get("name", "?")} ({data.get("domain", "?")})')
-    print(f'  ID: {data.get("id")}  Env: {data.get("environment_type")}  Health: {"OK" if data.get("is_healthy") else "DOWN"}')
-    print(f'  Version: {data.get("deployed_version", "?")}  Last seen: {_ago(data.get("last_seen"))}')
-    print(f'  Queue: {data.get("queue_depth", 0)} tasks, oldest {data.get("queue_oldest_seconds", 0)}s')
-    if data.get('edge_device_count'):
-        print(f'  Edge: {data.get("edge_devices_healthy", 0)}/{data.get("edge_device_count", 0)} healthy')
-    print()
-
-
-# ---------------------------------------------------------------------------
 # Commands: Tasks
 # ---------------------------------------------------------------------------
 
@@ -999,7 +925,7 @@ def cmd_tasks(args):
         # Task -> BoardCard -> Board -> Project (task has no direct project FK).
         # Param names must match TaskViewSet.filterset_fields exactly -
         # DjangoFilterBackend silently DROPS unregistered params, which made
-        # these filters no-ops (Feat #5478: daemon reclaim swept unfiltered lists).
+        # these filters no-ops (an unfiltered list looks exactly like a filtered one).
         try:
             params['board_card__board__project'] = str(int(args.project))
         except ValueError:
@@ -1013,20 +939,17 @@ def cmd_tasks(args):
         params['board_card__column__name'] = args.status
 
     # Paginate. The server caps a page at 50 rows regardless of `limit`/`page_size`,
-    # so a single call silently truncates any column past 50 (WORK on board 48 was
-    # 52 on 2026-07-21). The daemon ranks its pick queue CLIENT-side (priority +
-    # created_at FIFO, orchestrator #218), so a truncated page does not just hide
-    # the tail — it hides exactly the OLDEST tasks that FIFO order exists to reach,
-    # because the server sorts by -updated_at. Same class of silent wrongness as
-    # the dropped filter params in #5478: the list looks complete either way.
+    # so a single call silently truncates any column past 50. A caller that ranks
+    # the list CLIENT-side (e.g. priority + created_at FIFO) would lose exactly the
+    # OLDEST tasks, because the server sorts by -updated_at. Same class of silent
+    # wrongness as a dropped filter param: the list looks complete either way.
     #
     # CEILING: this is offset pagination (page N) over a MUTABLE sort key
     # (-updated_at). If a row's updated_at changes while this walk is mid-flight
     # (a concurrent edit between fetching page 1 and page 2), it can shift across
     # the page boundary and appear twice or be skipped once. Not fixable client-
     # side; would need server-side cursor pagination or a stable tiebreaker (id).
-    # Accepted for now because the daemon re-polls every ~30s (orchestrator
-    # daemon.py), so a skip self-heals within one tick.
+    # Accepted for now: a caller that re-polls sees a skipped row on the next call.
     results = []
     for page in range(1, TASKS_MAX_PAGES + 1):
         data = _get('/api/v1/pat/pm/tasks/', page=str(page), **params)
@@ -1062,9 +985,9 @@ def cmd_task(args):
     """Task detail."""
     data = _get(f'/api/v1/pat/pm/tasks/{args.id}/')
 
-    # Single source of truth for the deployment URL - downstream callers
-    # (orchestrator/daemon/cli_tools/aims.py, etc.) should NOT rebuild this
-    # from project_id + board + id. Keep the format here.
+    # Single source of truth for the task's web URL - downstream callers should
+    # read `url` from `--json task` rather than rebuild it from project_id +
+    # board + id. Keep the format here.
     if isinstance(data, dict) and data.get('id') and data.get('project_id') and data.get('board'):
         data['url'] = (
             f"{_get_url().rstrip('/')}/project-management/plan/pm-projects/"
@@ -1086,7 +1009,7 @@ def cmd_task(args):
     print(f'  Project: {data.get("project_name")}  Column: {data.get("column_name") or "-"}')
     print(f'  Priority: {data.get("priority")}  Assignee: {data.get("assignee_name") or "-"}')
 
-    # Sidecar/PM tracking fields. Always show stage + updated_at - they're the
+    # PM tracking fields. Always show stage + updated_at - they're the
     # cheapest "is something happening?" signal. Claim block prints only when
     # an engine is actively holding the task.
     stage = data.get('stage')
@@ -1614,7 +1537,7 @@ def cmd_deps(args):
         # Re-check BOTH sides of the pair client-side, never just `blocking_task`.
         # `blocked_task=<id>` above is a server-side filter param, and this exact
         # class of bug (DjangoFilterBackend silently drops an unregistered/renamed
-        # lookup and returns everything - #467, #5478) has hit this codebase twice.
+        # lookup and returns everything) has bitten this command before.
         # Trusting the server filtered correctly would let a same-blocker row for
         # a DIFFERENT task get deleted instead.
         match = [d for d in _deps_for(task_id, 'blocked_task')
@@ -1757,7 +1680,7 @@ def cmd_pipeline_stages(args):
 
 
 # ---------------------------------------------------------------------------
-# Commands: Sales follow-up engine (Feat #4600) - EmailTask cadence.
+# Commands: Sales follow-up engine - EmailTask cadence.
 # A due lead becomes a DRAFT EmailTask whose body IS the verbatim email.
 # followups-check enqueues DRAFTs; email-tasks lists them; email-task-set edits a
 # draft's body/subject/status. None can cross the SEND human-gate - the server
@@ -2056,10 +1979,10 @@ def _wiki_section_tail(wiki_text: str, start: int) -> str:
     """Everything after the header line at `start`, to the END OF THE WIKI.
 
     NOT the span: a body may legitimately carry its own `## ` line (the whole
-    fleet writes bodies like `## Verify: Phase 1\n\nevidence`), and `## ` is
+    common to write bodies like `## Verify: Phase 1\n\nevidence`), and `## ` is
     exactly what `_wiki_exact_sections` splits on -- so the span ENDS INSIDE the
     body it is supposed to contain, and a verbatim read-back compares the sent
-    body against the empty string. Measured 2026-09-08 on C2 #8896: a plain
+    body against the empty string. Observed: a plain
     `set --section HeadInBody` with such a body printed
     `[FAIL] ... section body does not equal what was sent` and exited 2 while the
     write had landed perfectly. Verification anchors on the header OFFSET and
@@ -2076,8 +1999,7 @@ def _wiki_lands_at(wiki_text: str, start: int, sent: str, header: str) -> bool:
     Prefix match plus a STALE-TAIL check, not `==`: equality cannot be asked here
     (the span ends inside a heading-bearing body -- see `_wiki_section_tail`), and a
     bare prefix match would accept a write that left the old body dangling after the
-    new one, which `wiki set --section` has actually done (memory:
-    tark-cli-wiki-set-replaces-section). So whatever follows the sent text must be
+    new one, which `wiki set --section` has actually done. So whatever follows the sent text must be
     nothing, or the header of a DIFFERENT section.
 
     "Different" is load-bearing. Accepting any `## ` line as the boundary cannot
@@ -2106,8 +2028,8 @@ def _wiki_lands_at(wiki_text: str, start: int, sent: str, header: str) -> bool:
 
 def _wiki_readback(path: str) -> str:
     """Fresh GET after a write -- never trust the write's own OK/response, always
-    re-fetch and diff. This is the proof every wiki write verb owes (2026-09-08:
-    `append` on an existing section was a silent no-op six times over)."""
+    re-fetch and diff. This is the proof every wiki write verb owes (`append`
+    on an existing section was once a silent no-op that still reported OK)."""
     data = _get(path)
     return data.get('wiki', '') if isinstance(data, dict) else (data or '')
 
@@ -2119,9 +2041,8 @@ def _wiki_write_fail(verb: str, task_id: int, section: str | None, reason: str) 
     sys.exit(2)
 
 
-# Cross-repo contract: these reason tags appear in shared fixture
-# (_tark/shared/wiki_recovery_cases.json) and the server-side mirror in
-# tark-platform `_recover_wiki_body`. Rename = drift = test failure.
+# Contract: these reason tags are shared with the server-side `_recover_wiki_body`
+# and its test fixture (wiki_recovery_cases.json). Rename = drift = test failure.
 _REASON_JSON_QUOTED = 'json_quoted'
 _REASON_NAKED_ESCAPE = 'naked_escape'
 
@@ -2134,9 +2055,8 @@ _NAKED_ESCAPE_MIN_LITERAL_N = 5
 def _recover_wiki_body(body: str) -> tuple[str, str | None, dict[str, int]]:
     """Recover from common caller mistakes that produce literal `\\n` in markdown.
 
-    Contract-equivalent to the server-side `_recover_wiki_body` in tark-platform
-    `backend/project_management/api/views/crud.py`. Both implementations are
-    pinned by the shared fixture at `_tark/shared/wiki_recovery_cases.json`.
+    Contract-equivalent to the server-side `_recover_wiki_body`. Both
+    implementations are pinned by a shared fixture (wiki_recovery_cases.json).
 
     Two corruptions are caught:
 
@@ -2314,8 +2234,8 @@ def cmd_wiki(args):
     Whole-body put uses PUT with payload field `wiki`.
 
     Every write below re-`GET`s the wiki after the POST/PUT and diffs it against
-    what was intended -- never trust the OK response alone (2026-09-04/09-08:
-    `append` onto an existing section reported OK while nothing landed, and a
+    what was intended -- never trust the OK response alone (`append` onto an
+    existing section has reported OK while nothing landed, and a
     dropped connection printed its error but still exited 0). A mismatch prints
     `[FAIL] wiki <verb> #<id> section "<X>": <reason>` and exits 2.
     """
@@ -2372,13 +2292,12 @@ def cmd_wiki(args):
     # Retry ONCE from a fresh GET on a verification mismatch -- but ONLY when the
     # read-back proves NOTHING landed (the wiki came back byte-identical to the
     # pre-write GET). That is the one collision signal this endpoint leaves: it has
-    # no version/count field to preflight against, unlike the C2 contract editor's
-    # block_overrides (memory: c2-contract-editor-edits-concurrently-with-api-patches).
+    # no version/count field to preflight against.
     # A blind retry is NOT safe here: when the write DID land and only the check
     # disagreed, the second pass re-derives `exists` from the now-changed wiki, flips
-    # `set` from append to replace, and writes the body a SECOND time. Measured
-    # 2026-09-08 on C2 #8896: one `set` of a heading-bearing body left that body
-    # duplicated inside the section AND still exited 2.
+    # `set` from append to replace, and writes the body a SECOND time. Observed:
+    # one `set` of a heading-bearing body left that body duplicated inside the
+    # section AND still exited 2.
     last_reason = ''
     ok = False
     for attempt in range(2):
@@ -2438,7 +2357,7 @@ def cmd_wiki(args):
         opening = _WIKI_HEADER_RE.match(send_body.lstrip('\n'))
         if attempt == 0 and opening and opening.group('title').strip() == header:
             _warn(f'body opens with its own "## {header}" heading, so the card will hold a '
-                  f'DOUBLE header (C2 #4992). Send the body WITHOUT the `## {header}` line.')
+                  f'DOUBLE header. Send the body WITHOUT the `## {header}` line.')
         actual_wiki = _wiki_readback(path)
         actual_spans = _wiki_exact_sections(actual_wiki, header)
         if expect == 'created':
@@ -2581,32 +2500,6 @@ def cmd_contract_blocks(args):
     )
 
 
-def cmd_sites_active(args):
-    """Active-now sites (GET /c2/sites/active-now/) - c2:read.
-
-    The endpoint 400s without a domain set, so --domains is required.
-    """
-    if not getattr(args, 'domains', None):
-        _err('--domains is required (comma-separated, e.g. --domains a.tt.ee,b.tt.ee).')
-    params = {'domains': args.domains}
-    if getattr(args, 'window', None):
-        params['window'] = args.window
-    data = _get('/api/v1/pat/c2/sites/active-now/', **params)
-    if args.json:
-        _json_out(data)
-        return
-    print(f'\n  ACTIVE NOW - {data.get("active_users", 0)} distinct user(s), '
-          f'window {data.get("window_minutes", "?")}m\n')
-    rows = [
-        [domain, info.get('active_users', 0), info.get('last_event_at') or '-']
-        for domain, info in (data.get('per_domain') or {}).items()
-    ]
-    _table(['Domain', 'Active', 'Last event'], rows)
-    if data.get('missing_domains'):
-        print(f'\n  Not tracked: {", ".join(data["missing_domains"])}')
-    print()
-
-
 def cmd_boards_create(args):
     """Create a PM board (POST /pm/boards/) - pm:write."""
     data = _request('POST', '/api/v1/pat/pm/boards/',
@@ -2720,7 +2613,7 @@ def _require_flags(args, required, cmd):
         _err(f'{cmd}: missing required --' + ', --'.join(m.replace('_', '-') for m in missing))
 
 
-# Field specs (writable-only). See serializer sources in tark-platform backend.
+# Field specs (writable-only). Mirror the server's PAT serializers.
 _OFFER_FIELDS = [
     ('title', 'title', 's'), ('client', 'client', 'i'), ('contact', 'contact', 'i'),
     ('company_name', 'company_name', 's'), ('contact_name', 'contact_name', 's'),
@@ -3168,8 +3061,8 @@ def cmd_config(args):
 # ---------------------------------------------------------------------------
 
 def build_parser() -> argparse.ArgumentParser:
-    # Match prog to the binary name (supports both the canonical ~/bin/tark_cli symlink
-    # and a direct invocation of ./cli/tark). Falls back to "tark_cli" to match docs.
+    # Match prog to the binary name (supports a `tark_cli` symlink on PATH and a
+    # direct ./tark_cli.py invocation). Falls back to "tark_cli" to match docs.
     prog_name = Path(sys.argv[0]).name if sys.argv and sys.argv[0] else 'tark_cli'
     parser = argparse.ArgumentParser(
         prog=prog_name,
@@ -3190,16 +3083,6 @@ def build_parser() -> argparse.ArgumentParser:
         help='Env var name to read PAT from (overrides the default TARK_PAT/C2_PAT lookup)',
     )
     sub = parser.add_subparsers(dest='command')
-
-    # status
-    sub.add_parser('status', help='Deployment grid summary')
-
-    # deployments
-    sub.add_parser('deployments', help='List deployments')
-
-    # deploy <id|domain>
-    p = sub.add_parser('deploy', help='Deployment detail')
-    p.add_argument('identifier', help='Deployment ID or domain substring')
 
     # tasks
     p = sub.add_parser('tasks', help='List tasks')
@@ -3435,11 +3318,6 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser('contract-templates', help='Contract templates (system)')
     sub.add_parser('contract-blocks', help='Contract blocks (system)')
 
-    # sites-active (c2:read) - requires --domains
-    p = sub.add_parser('sites-active', help='sites active-now (needs --domains)')
-    p.add_argument('--domains', required=True, help='Comma-separated domains, e.g. a.tt.ee,b.tt.ee')
-    p.add_argument('--window', help='Activity window, e.g. 15m, 1h (default 15m)')
-
     # boards-create (pm:write)
     p = sub.add_parser('boards-create', help='Create a PM board')
     p.add_argument('project', type=int, help='Project ID')
@@ -3548,9 +3426,6 @@ def build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 
 COMMANDS = {
-    'status': cmd_status,
-    'deployments': cmd_deployments,
-    'deploy': cmd_deploy,
     'tasks': cmd_tasks,
     'task': cmd_task,
     'create': cmd_create,
@@ -3584,7 +3459,6 @@ COMMANDS = {
     'contract-types': cmd_contract_types,
     'contract-templates': cmd_contract_templates,
     'contract-blocks': cmd_contract_blocks,
-    'sites-active': cmd_sites_active,
     'boards-create': cmd_boards_create,
     'comment': cmd_comment,
     'task-delete': cmd_task_delete,
@@ -3630,9 +3504,7 @@ def main():
         _PAT_OVERRIDE = val
 
     if not args.command:
-        # Default: show status
-        args.command = 'status'
-        cmd_status(args)
+        parser.print_help()
         return
 
     handler = COMMANDS.get(args.command)

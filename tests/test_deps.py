@@ -3,13 +3,9 @@
 No network: `tark_cli._get` and `tark_cli._request` are mocked, and every call's
 path / params / body is captured.
 
-Context: PM `TaskDependency` had a model, serializer, viewset and UI but was never
-registered on the PAT surface, so the two blockers on C2 #5617 had to be created
-by ssh'ing to prod and driving the web endpoint through a Django shell
-(2026-07-21). This command ships the CLI half of the `backend/project_management/
-api/pat_urls.py` INVARIANT ("every PAT registration must have a matching CLI
-command") — it fully closes only once tark-platform registers the PAT endpoint
-(tracked as C2 #5643 Scope row 5, FOLLOWUP). Until then `deps` 404s by design;
+Context: PM `TaskDependency` exists in the web UI, and this command is the CLI half
+of the INVARIANT "every PAT registration must have a matching CLI command". On a
+server that does not expose the PAT `task-dependencies` endpoint yet, `deps` 404s;
 see DepsNotYetDeployedTests below for the clean-failure contract that covers it.
 """
 import io
@@ -120,8 +116,8 @@ class DepsAddTests(_Harness):
             self._run(_ns(5617, 'add'))
 
     def test_add_rejects_self_block(self):
-        """A self-dependency would be permanently unsatisfiable, and the daemon's
-        own dep scanner explicitly skips self-references."""
+        """A self-dependency would be permanently unsatisfiable, so it is refused
+        client-side."""
         with self.assertRaises(SystemExit):
             self._run(_ns(5617, 'add', blocker=5617))
 
@@ -149,8 +145,7 @@ class DepsRemoveTests(_Harness):
 
     def test_remove_ignores_a_row_for_a_different_blocked_task(self):
         """A server that silently drops the `blocked_task` filter param (the exact
-        DjangoFilterBackend failure mode already hit twice on this codebase - #467,
-        #5478) must NOT cause `remove` to delete some other task's dependency just
+        DjangoFilterBackend failure mode that has bitten this command before) must NOT cause `remove` to delete some other task's dependency just
         because it shares the same `blocking_task`. The client re-checks both
         sides of the pair, not just `blocking_task`."""
         gets, requests, out = self._run(
@@ -175,8 +170,7 @@ class DepsRemoveTests(_Harness):
 
 
 class DepsNotYetDeployedTests(unittest.TestCase):
-    """The PAT `task-dependencies` endpoint does not exist on any deployed
-    tark-platform yet (C2 #5643 Scope row 5, FOLLOWUP — separate repo/PR). Every
+    """A server may not expose the PAT `task-dependencies` endpoint yet. Every
     `deps` call must 404 as a CLEAN CLI error: no traceback, and `--json` stdout
     must stay empty (never a corrupted mix of a warning line + partial JSON).
     Exercises the REAL `_request` HTTP-error path (urllib mocked at the transport
