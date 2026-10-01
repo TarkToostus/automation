@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Personal dashboard — what /c2 shows in one screen:
+# Personal dashboard in one screen:
 #   - Active timer (if any)
 #   - My open tasks
 #   - Time logged today + this week

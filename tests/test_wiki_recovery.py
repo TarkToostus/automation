@@ -1,6 +1,6 @@
 """Tests for tark_cli wiki body recovery.
 
-Mirror of the server-side recovery in tark-platform's `_recover_wiki_body`.
+Mirror of the server-side recovery in `_recover_wiki_body`.
 The CLI catches the same JSON-double-encode and naked-escape mistakes locally
 so the caller sees a warning before the request leaves their machine.
 """
@@ -131,11 +131,10 @@ class WikiRecoveryTests(unittest.TestCase):
         f'shared fixture not at {_SHARED_FIXTURE}',
     )
     def test_shared_fixture_contract(self):
-        """Run every case from _tark/shared/wiki_recovery_cases.json.
+        """Run every case from the shared wiki_recovery_cases.json fixture.
 
-        Cross-repo contract: the server-side test in tark-platform runs the
-        same fixture against its own _recover_wiki_body. Drift in either
-        implementation fails locally before the umbrella repo merges.
+        Contract: the server-side test runs the same fixture against its own
+        _recover_wiki_body, so drift in either implementation fails a test.
         """
         data = json.loads(_SHARED_FIXTURE.read_text())
         for case in data['cases']:

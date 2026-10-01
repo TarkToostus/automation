@@ -7,10 +7,9 @@ Two things are covered, and only one of them is new code.
 **The filter lookups (regression coverage for a fix that shipped untested).**
 DRF's DjangoFilterBackend SILENTLY IGNORES a query param that is not in
 `filterset_fields`, so a stale lookup name returns EVERY task in the tenant while
-looking perfectly filtered. tark-platform #467 (2026-06-22) moved the task → board
-link behind `board_card`, silently invalidating the lookups this command sent;
-`0c2cdc9` (#5478) renamed them to the registered names but added no test, so
-nothing stops the next rename from re-breaking it just as quietly. These
+looking perfectly filtered. A server change moved the task → board link behind
+`board_card`, silently invalidating the lookups this command sent; they were
+renamed to the registered names but without a test, so nothing stopped the next rename from re-breaking it just as quietly. These
 assertions pin each server-side lookup name so a future divergence fails loudly
 instead of degrading to "return everything".
 
@@ -64,10 +63,10 @@ class TasksFilterTests(unittest.TestCase):
     def test_board_filter_uses_board_card_lookup(self):
         calls, _ = self._run(board=48)
         self.assertEqual(calls[0]['board_card__board'], '48')
-        # The pre-#467 name must be gone — the server ignores it, returning everything.
+        # The old pre-`board_card` name must be gone — the server ignores it, returning everything.
         self.assertNotIn('board', calls[0])
 
-    def test_daemon_call_shape_survives_a_page_walk(self):
+    def test_scoped_call_shape_survives_a_page_walk(self):
         """The filters must be re-sent on EVERY page, not just the first — dropping
         them on page 2 would silently splice unfiltered rows onto a filtered list."""
         pages = [
@@ -90,7 +89,7 @@ class TasksFilterTests(unittest.TestCase):
         self.assertNotIn('board__project', calls[0])
 
     def test_board_and_status_combine(self):
-        """The daemon's exact call — board-scoped AND column-scoped in one request."""
+        """A board-scoped AND column-scoped call in one request."""
         calls, _ = self._run(board=48, status='WORK')
         self.assertEqual(calls[0]['board_card__board'], '48')
         self.assertEqual(calls[0]['board_card__column__name'], 'WORK')
@@ -106,7 +105,7 @@ class TasksFilterTests(unittest.TestCase):
 class TasksPaginationTests(unittest.TestCase):
     """The server caps a page at 50 rows whatever `limit` says, so `tasks` must
     follow `next` — a single call truncates any column past 50, and it truncates
-    the OLDEST rows (server order is -updated_at) that the daemon's FIFO pick
+    the OLDEST rows (server order is -updated_at) that a client-side FIFO pick
     order exists to reach."""
 
     def _run(self, pages, **kw):

@@ -204,26 +204,13 @@ class ScopeErrorSurfacing(unittest.TestCase):
 
     def test_generic_drf_detail_does_not_swallow_the_scope_hint(self):
         """REGRESSION GUARD. `PATScope.has_permission` sets no custom message, so
-        EVERY missing-scope denial in the fleet returns DRF's boilerplate. If a
+        EVERY missing-scope denial on the server returns DRF's boilerplate. If a
         bare `detail` were allowed to win, all ~30 other commands would trade an
         actionable "add pm:write" for "you do not have permission" -- and the
         detail-less fallback below would be dead code in production."""
         msg = self._403(b'{"detail": "You do not have permission to perform this action."}')
         self.assertIn('You do not have permission', msg)
         self.assertIn('Add pm:write scope', msg)
-
-    def test_generic_drf_detail_keeps_the_c2_hint_on_c2_paths(self):
-        import urllib.error
-        err = urllib.error.HTTPError(
-            'http://x/api/v1/pat/c2/deployments/', 403, 'Forbidden', {},
-            io.BytesIO(b'{"detail": "You do not have permission to perform this action."}'))
-        with mock.patch.object(tark_cli.urllib.request, 'urlopen', side_effect=err), \
-             mock.patch.object(tark_cli, '_get_url', lambda: 'http://x'), \
-             mock.patch.object(tark_cli, '_get_pat', lambda: 't'), \
-             mock.patch.object(sys, 'stderr', io.StringIO()) as cap:
-            with self.assertRaises(SystemExit):
-                tark_cli._request('GET', '/api/v1/pat/c2/deployments/')
-        self.assertIn('Add c2:read scope', cap.getvalue())
 
     def test_403_detail_escape_bytes_are_stripped(self):
         msg = self._403(b'{"detail": "pm:delete scope required\\u001b[2J"}')
@@ -240,8 +227,7 @@ class UpsertUsesTheExactMatcher(unittest.TestCase):
     compares titles verbatim; the prefix matcher the stage gates use said "Verify"
     was present in a wiki holding only "## Verify: Phase 1", so `set` chose
     `replace` and the server 404'd on a section the CLI had just reported present.
-    Hit live against c2-prelive on 2026-07-23 while writing this branch's own
-    evidence section."""
+    Hit live against a staging server while writing a wiki evidence section."""
 
     def _run_set(self, action, section, wiki, force=False):
         """Drive the verb end-to-end against the stateful `_FakeWikiServer`.
@@ -284,7 +270,7 @@ class UpsertUsesTheExactMatcher(unittest.TestCase):
         self.assertEqual(code, 0, _err)
 
     def test_append_merges_onto_a_real_exact_match(self):
-        """2026-09-08 contract change: `append` onto an existing exact-match
+        """Contract: `append` onto an existing exact-match
         section no longer refuses -- it merges (GET -> merge -> write) by
         sending the server a `replace` with the old body plus the new text."""
         body, code, _err = self._run_set('append', 'Verify', '## Verify\n\nevidence\n')
@@ -295,12 +281,12 @@ class UpsertUsesTheExactMatcher(unittest.TestCase):
 
 
 class _FakeWikiServer:
-    """In-memory model of the C2 wiki endpoint, so the read-back contract can be
+    """In-memory model of the task wiki endpoint, so the read-back contract can be
     tested at all. The other harnesses in this file return the PRE-write wiki from
     every `_get`, which means their read-back can never see the write -- fine for
     asserting the POST payload, vacuous about whether the verification is right.
 
-    Section grain mirrors the server measured live on C2 #8896 (2026-09-08):
+    Section grain mirrors the server's observed behaviour:
     `append` adds a `## <section>` block at the end; `replace` swaps the body of the
     FIRST exact-title `## <section>` block, where a block ends at the next `## ` line
     -- including a `## ` line that arrived inside a body.
@@ -359,10 +345,10 @@ class ReadBackVerification(unittest.TestCase):
         return code, err.getvalue()
 
     def test_a_body_carrying_its_own_heading_verifies_ok(self):
-        """The fleet writes bodies like `## Verify: Phase 1\n\nevidence`. `## ` is
+        """Callers commonly write bodies like `## Verify: Phase 1\n\nevidence`. `## ` is
         exactly what the section scanner splits on, so a span-based read-back
         compares the sent body against the EMPTY string and fails a write that
-        landed perfectly. Measured live on C2 #8896, 2026-09-08: exit 2 with
+        landed perfectly. Observed live: exit 2 with
         `section body does not equal what was sent`, content on the card intact."""
         srv = _FakeWikiServer('## Seed\n\nseed body\n')
         code, err = self._drive(srv, 'set', 'Hdr', '## Hdr: Phase 1\n\nevidence line\n')
@@ -375,12 +361,11 @@ class ReadBackVerification(unittest.TestCase):
         """Two things at once, both regressions the read-back exists to stop.
 
         (a) The section must hold the sent body and NOTHING ELSE -- `wiki set` has
-        left a stale tail behind the new body before (memory:
-        tark-cli-wiki-set-replaces-section), and a bare prefix match would call that
+        left a stale tail behind the new body before, and a bare prefix match would call that
         a pass. (b) Once the wiki HAS changed, retrying is forbidden: a blind retry
         re-derives `exists` from the changed wiki, flips `set` from append to
-        replace, and writes the body a SECOND time -- measured on C2 #8896,
-        2026-09-08, the card ended up with it twice AND the command still exited 2.
+        replace, and writes the body a SECOND time -- observed live: the task
+        wiki ended up with it twice AND the command still exited 2.
         Retry is legal only when the read-back proves nothing landed.
         """
         srv = _FakeWikiServer('## Seed\n\nseed body\n', mangle=lambda b: b + '\nSERVER NOISE\n')

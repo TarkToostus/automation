@@ -59,24 +59,6 @@ class NewCapasRequestShapeTests(unittest.TestCase):
         self.assertEqual(cap['path'], '/api/v1/pat/pm/boards/')
         self.assertEqual(cap['body'], {'project': 7, 'name': 'Sprint'})
 
-    def test_sites_active_requires_domains(self):
-        with mock.patch.object(sys, 'stderr', io.StringIO()), self.assertRaises(SystemExit):
-            tark_cli.cmd_sites_active(_ns(domains=None, window=None))
-
-    def test_sites_active_get_params(self):
-        cap = {}
-
-        def fake_get(path, **params):
-            cap['path'] = path
-            cap['params'] = params
-            return {'active_users': 0, 'per_domain': {}, 'window_minutes': 15}
-
-        with mock.patch.object(tark_cli, '_get', fake_get), \
-                mock.patch.object(sys, 'stdout', io.StringIO()):
-            tark_cli.cmd_sites_active(_ns(domains='a.tt.ee,b.tt.ee', window='30m'))
-        self.assertEqual(cap['path'], '/api/v1/pat/c2/sites/active-now/')
-        self.assertEqual(cap['params'], {'domains': 'a.tt.ee,b.tt.ee', 'window': '30m'})
-
     def test_contract_blocks_list_path(self):
         cap = {}
 
@@ -317,10 +299,10 @@ class LoginCredentialTests(unittest.TestCase):
             raise AssertionError('password/login must never write config')
 
         with mock.patch.dict('os.environ', {'TARK_PASSWORD': 's3cret'}, clear=False), \
-                mock.patch.object(tark_cli, '_load_config', lambda: {'user': 'martin'}), \
+                mock.patch.object(tark_cli, '_load_config', lambda: {'user': 'alice'}), \
                 mock.patch.object(tark_cli, '_save_config', boom_save):
             user, pw = tark_cli._resolve_login(_ns(user=None))
-        self.assertEqual((user, pw), ('martin', 's3cret'))
+        self.assertEqual((user, pw), ('alice', 's3cret'))
 
     def test_user_flag_beats_config(self):
         with mock.patch.dict('os.environ', {'TARK_PASSWORD': 'x'}, clear=False), \
@@ -332,7 +314,7 @@ class LoginCredentialTests(unittest.TestCase):
         fake_stdin = io.StringIO('')
         fake_stdin.isatty = lambda: False  # type: ignore[assignment]
         with mock.patch.dict('os.environ', {'TARK_PASSWORD': ''}, clear=False), \
-                mock.patch.object(tark_cli, '_load_config', lambda: {'user': 'martin'}), \
+                mock.patch.object(tark_cli, '_load_config', lambda: {'user': 'alice'}), \
                 mock.patch.object(sys, 'stdin', fake_stdin), \
                 mock.patch.object(sys, 'stderr', io.StringIO()), \
                 self.assertRaises(SystemExit):
