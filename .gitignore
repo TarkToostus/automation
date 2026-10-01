@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Config — never commit a PAT
+.config/
+*.env
+.env*
+
+# Editors
+.vscode/
+.idea/
+*.swp
+.DS_Store
+templates/
+
+# Verification artifacts (screenshots, transcripts)
+.proof/
