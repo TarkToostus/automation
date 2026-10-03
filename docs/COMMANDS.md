@@ -100,6 +100,70 @@ tark_cli tasks
 | `tark_cli api <path> --post '{...}'` / `--patch '{...}'` | Generic POST / PATCH escape hatch |
 | `tark_cli api "pm/tasks/?board=12&page=2"` | Inline query string; merges with `--filter` (flag wins on key clash) |
 
+## Common Commands — Tark Aeg schedules (`aeg`)
+
+Needs a seat that holds a schedule capability (manage all / location / team schedules) — the
+CLI can do exactly what that person can in the schedule editor, for the employees in their scope.
+Two ways in (`aeg --auth auto|pat|login`, default `auto`):
+
+- **PAT** — a `workforce:read` / `workforce:write` token on `/api/v1/pat/workforce/`, used when
+  the server has that API. **Not yet available on servers** (the PAT schedule API is parked):
+  today every server answers 404 and `auto` goes to seat login — don't mint `workforce:*` tokens.
+- **Seat login** — otherwise (or `--auth login`): logs in like the web app as `aeg --user <name>`
+  (or profile `user` / `$TARK_AEG_USER`) and calls the web schedule-editor endpoints. The
+  password is read from the environment, never stored, and only sent to the host it belongs to:
+  `--password-env VAR` wins for any host; a `--url` host that is not the target's own host
+  (the profile's url, else the default url) gets **no** env password — pass `--password-env` or
+  type it at the prompt; under `--profile` the env var named by the profile's `password_env`;
+  a profile without one uses `$TARK_AEG_PASSWORD` only when it is on the default target's host,
+  a profile on any other host must set its own `password_env`; on the default target
+  `$TARK_AEG_PASSWORD`, then top-level `password_env`, then `$TARK_PASSWORD` (never sent to a
+  profile's or a `--url` host); else a prompt. The JWT pair is cached in
+  `~/.config/tark/aeg-sessions.json` (0600; login is rate-limited); `aeg --relogin` drops it.
+
+`--url` overrides the host for one run; only an explicit `--pat`/`--pat-env` is sent there (a
+stored or `$TARK_PAT` token never is) — without one, `aeg` goes straight to seat login (password:
+`--password-env` or the prompt).
+
+Writes go through the Plan/Actual save (no "schedule published" event). A seat without a
+Plan/Actual capability gets a 403 there and the write **aborts** (exit 1, nothing more written).
+`--legacy-save` (on `set` / `apply` / `delete`) opts into the Graafik save for that case instead —
+it writes something other than the location-scoped diff: one location-less shift per day, located
+rows are NOT deleted, and one "schedule published" notification per month goes to the employees.
+`--legacy-save` is shown in the `--dry-run` output and the confirm prompt, and always asks for
+confirmation (or `--yes`). `--json` on a write prints one JSON document (ops, issues, written
+counts, verified cells) on stdout; the human tables go to stderr.
+`--resolve-ip IP` (or profile key `resolve_ip`) pins the profile's host to an IP while DNS
+propagates; the profile key is ignored when `--url` points at another host.
+
+| Command | What it does |
+|---------|-------------|
+| `tark_cli aeg employees --department Vastuvõtt` | Employees in scope (filters: `--department/--location/--role/--search`) |
+| `tark_cli aeg shifts --location Vastuvõtt` / `aeg locations` / `aeg departments` | Shift catalogue, locations, role groups |
+| `tark_cli aeg schedule get --from 2026-10-05 --to 2026-10-11 -d Vastuvõtt` | Planned shifts (grid ≤ 14 days, else list; repeated `--date` = only those days, ≤ 92-day span; `--json` before `aeg` for raw) |
+| `tark_cli aeg schedule set -e "Mari Maasikas" --date 2026-10-05 --shift "Vastuvõtt päev"` | Set one shift (replaces that day's shift at the same location — shifts at other locations are kept; `--dry-run`) |
+| `tark_cli aeg schedule apply plan.json --dry-run` | Diff + rule check a JSON/CSV plan; drop `--dry-run` to write (one request per month; exit 3 on violations without `--force`). `--prune` also deletes the plan people's other shifts in range, only at the plan's location(s). `"shift": null` (empty CSV cell) clears that person's day at the entry's `location`, else the plan's `location`, else their home location — never elsewhere |
+| `tark_cli aeg schedule delete --date 2026-12-31 -e "Mari Maasikas" --yes` | Delete planned shifts (needs a selector or `--all-in-scope`). Repeated `--date` = exactly those days; `-l` = rows at that location; `-d` = its people's rows at its location(s) (location-less rows of its people included) |
+| `tark_cli aeg schedule check --week 2026-W41 -d Vastuvõtt --require "Vastuvõtt päev=2"` | Rest (11 h), days in a row (5), h/week (48), headcount, `--senior` checks; exit 3 on violations |
+
+## Profiles (second server / tenant)
+
+`--profile NAME` (or `$TARK_PROFILE`) selects `profiles.NAME` in `config.json`; its url + PAT
+never fall back to the default ones, so the default (C2) setup keeps working unchanged.
+
+```bash
+tark_cli --profile demo config set url https://demo.example.com
+tark_cli --profile demo config set pat_env TARK_DEMO_PAT   # PAT read from this env var
+tark_cli --profile demo aeg employees
+# no PAT API on that server? log in as the seat instead (password only from the env):
+tark_cli --profile demo config set user demo.manager
+tark_cli --profile demo config set password_env TARK_DEMO_PASSWORD   # required off the default host
+tark_cli --profile demo aeg employees
+```
+
+`config set password …` (any `*password*` key but `password_env`) is refused — passwords
+live only in env vars.
+
 Run `tark_cli --help` for the full list, or `tark_cli <command> --help` for flags.
 
 ## Token management (`tokens`)
@@ -115,7 +179,10 @@ tark_cli tokens revoke <id> [--yes]   # soft-revoke (is_active=False), destructi
 ```
 
 - **Username** — `--user`, else config `user` (`tark_cli config set user <name>`), else prompt.
-- **Password** — `getpass` prompt, or `$TARK_PASSWORD` for automation. **Never stored**, never
+- **Password** — `getpass` prompt, or from the environment for automation: `$TARK_PASSWORD` on
+  the default target only; under `--profile` / `--url` the same rules as `aeg` seat login
+  (`--password-env`, profile `password_env`, `$TARK_AEG_PASSWORD` on the default host only).
+  **Never stored**, never
   written to config; the JWT lives in memory for the one request. Keep secrets in a
   private (chmod 600) env file you source, never inline.
 - `tokens create` prints the token **once** — store it immediately.
