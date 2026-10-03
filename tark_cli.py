@@ -78,6 +78,16 @@ Usage (examples assume `tark_cli` is on your PATH, e.g. a symlink to tark_cli.py
     tark_cli tokens create --name X --scope pm:write [--scope ...] [--expires YYYY-MM-DD]  # Mint a PAT (shown once)
     tark_cli tokens revoke <id> [--yes]     # Revoke a PAT (DESTRUCTIVE)
 
+    tark_cli aeg employees|shifts|locations|departments [-d DEPT]   # Workforce catalogue (seat login)
+    tark_cli aeg schedule get --from D --to D [-d DEPT] [-e NAME]    # Planned shifts (grid/list)
+    tark_cli aeg schedule set -e NAME --date D --shift S [--dry-run] # Set a shift (seat schedule capability)
+    tark_cli aeg schedule apply plan.json|csv [--dry-run] [--prune]  # Diff + check + write a plan
+    tark_cli aeg schedule delete --date D -e NAME [--dry-run] [--yes] # Delete planned shifts
+    tark_cli aeg schedule check --week 2026-W41 [--require S=N]      # 11h rest / days in a row / h-week
+
+    tark_cli --profile demo <command>       # Use profiles.demo from config.json (own url + PAT)
+    tark_cli --url https://... --pat-env V <command>  # One-off host (only an explicit PAT is sent)
+
     tark_cli api <path> [--filter k=v ...]  # Generic GET for any /pat/<path>/
     tark_cli api <path> --post <json>       # Generic POST
     tark_cli api <path> --patch <json>      # Generic PATCH
@@ -91,6 +101,7 @@ Auth: TARK_PAT env var (legacy C2_PAT also works), or ~/.config/tark/config.json
 """
 
 import argparse
+import contextlib
 import getpass
 import json
 import os
@@ -131,19 +142,84 @@ def _load_config() -> dict:
     return {}
 
 
+def _write_private(path: Path, text: str) -> None:
+    """Atomically replace `path` with `text`, never readable by anyone but the owner:
+    written to a 0600 temp file in the same dir, then os.replace'd over the target.
+    A new parent dir is created 0700."""
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = path.with_name(f'.{path.name}.{os.getpid()}.tmp')
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)  # a stale temp file keeps its old mode through O_CREAT
+        with os.fdopen(fd, 'w') as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _save_config(cfg: dict) -> None:
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    with open(CONFIG_FILE, 'w') as f:
-        json.dump(cfg, f, indent=2)
-    os.chmod(CONFIG_FILE, 0o600)
+    _write_private(CONFIG_FILE, json.dumps(cfg, indent=2))
 
 
 _PAT_OVERRIDE: str = ""  # set by main() when --pat / --pat-env is supplied
+_URL_OVERRIDE: str = ""  # set by main() when --url is supplied
+_PROFILE: str = ""  # set by main() from --profile / $TARK_PROFILE
+_PASSWORD_ENV_OVERRIDE: str = ""  # set by main() when --password-env is supplied
+
+
+# Named profiles let one config.json drive several servers/tenants side by side:
+#
+#   {"url": "https://c2...", "pat": "tark_pat_...",            <- default (C2) profile
+#    "profiles": {"demo": {"url": "https://demo.example.com",
+#                          "pat_env": "TARK_DEMO_PAT"}}}       <- `--profile demo`
+#
+# A selected profile is a SEALED credential set: its url/PAT never fall back to
+# the top-level keys or to TARK_URL/TARK_PAT, so a token minted for one server is
+# never sent to another. `pat_env` names an env var holding the PAT (keeps the
+# token out of the file); `pat` stores it inline (file is chmod 600).
+
+def _profile_cfg() -> dict | None:
+    """The selected profile's dict, or None when no profile is selected."""
+    if not _PROFILE:
+        return None
+    profiles = _load_config().get('profiles') or {}
+    prof = profiles.get(_PROFILE)
+    if not isinstance(prof, dict):
+        known = ', '.join(sorted(profiles)) or '(none)'
+        _err(f'Unknown profile {_PROFILE!r}. Known profiles: {known}.\n'
+             f'Create it with: tark_cli --profile {_PROFILE} config set url https://...')
+    return prof
+
+
+def _cfg_get(key: str, default=''):
+    """Config value from the selected profile, else the top-level config."""
+    prof = _profile_cfg()
+    if prof is not None:
+        return prof.get(key, default)
+    return _load_config().get(key, default)
 
 
 def _get_pat() -> str:
     if _PAT_OVERRIDE:
         return _PAT_OVERRIDE
+    if _URL_OVERRIDE:
+        # --url points at a host the stored PATs were not minted for: never send them there.
+        _err('--url needs an explicit --pat or --pat-env (the stored/env PAT is never sent '
+             'to an overridden host).')
+    prof = _profile_cfg()
+    if prof is not None:
+        env_name = prof.get('pat_env', '')
+        pat = (os.environ.get(env_name, '') if env_name else '') or prof.get('pat', '')
+        if not pat:
+            where = f'${env_name} is empty' if env_name else 'no `pat`/`pat_env` set'
+            _err(f'Profile {_PROFILE!r} has no PAT ({where}). Set one with:\n'
+                 f'  tark_cli --profile {_PROFILE} config set pat_env TARK_{_PROFILE.upper()}_PAT')
+        return pat
     # TARK_PAT is the primary env var; C2_PAT stays a backward-compat fallback.
     pat = (os.environ.get('TARK_PAT') or os.environ.get('C2_PAT', '')
            or _load_config().get('pat', ''))
@@ -153,9 +229,40 @@ def _get_pat() -> str:
     return pat
 
 
+def _default_url() -> str:
+    """The default (C2) target's URL - ignores --url and --profile; '' when unset."""
+    return (os.environ.get('TARK_URL') or os.environ.get('C2_URL', '')
+            or _load_config().get('url', '') or DEFAULT_URL)
+
+
+def _url_host(url: str) -> tuple[str, int | None]:
+    """(lower-case host, port with the scheme default filled in) of a URL."""
+    parts = urllib.parse.urlsplit(url if '//' in (url or '') else f'//{url or ""}')
+    try:
+        port = parts.port
+    except ValueError:
+        port = None
+    return (parts.hostname or '').lower(), port or {'http': 80, 'https': 443}.get(parts.scheme)
+
+
+def _same_host(a: str, b: str) -> bool:
+    """Do two URLs point at the same host:port? Used to decide whether a
+    credential / IP pin that belongs to one target may follow an override."""
+    ha = _url_host(a)
+    return bool(ha[0]) and ha == _url_host(b)
+
+
 def _get_url() -> str:
-    url = (os.environ.get('TARK_URL') or os.environ.get('C2_URL', '')
-           or _load_config().get('url', '') or DEFAULT_URL)
+    if _URL_OVERRIDE:
+        return _URL_OVERRIDE
+    prof = _profile_cfg()
+    if prof is not None:
+        url = prof.get('url', '')
+        if not url:
+            _err(f'Profile {_PROFILE!r} has no url. Set it with:\n'
+                 f'  tark_cli --profile {_PROFILE} config set url https://...')
+        return url
+    url = _default_url()
     if not url:
         _err('No deployment URL configured. Set it with:\n'
              '  tark_cli config set url https://your-deployment.example.com\n'
@@ -164,8 +271,11 @@ def _get_url() -> str:
 
 
 def _get_user_id() -> int | None:
-    val = (os.environ.get('TARK_USER_ID') or os.environ.get('C2_USER_ID', '')
-           or _load_config().get('user_id', ''))
+    if _profile_cfg() is not None:
+        val = _cfg_get('user_id', '')
+    else:
+        val = (os.environ.get('TARK_USER_ID') or os.environ.get('C2_USER_ID', '')
+               or _load_config().get('user_id', ''))
     return int(val) if val else None
 
 
@@ -192,7 +302,19 @@ def _sanitize_inline(text: str) -> str:
     return _CONTROL_CHARS_RE.sub('', text or '')
 
 
-def _request(method: str, path: str, body: dict | None = None, params: dict | None = None) -> dict | list:
+class _SoftHTTPError(Exception):
+    """Raised by _request for a status the caller asked to handle itself."""
+
+    def __init__(self, code: int, body_text: str):
+        super().__init__(f'HTTP {code}')
+        self.code = code
+        self.body_text = body_text
+
+
+def _request(method: str, path: str, body: dict | None = None, params: dict | None = None,
+             soft_errors: tuple = (), bearer: str | None = None) -> dict | list:
+    """PAT-authenticated request. `bearer` substitutes a web-login JWT for the PAT
+    (only `aeg` seat-login mode passes one - see _aeg_session)."""
     base = _get_url().rstrip('/')
     url = f'{base}{path}'
 
@@ -203,7 +325,7 @@ def _request(method: str, path: str, body: dict | None = None, params: dict | No
 
     data = json.dumps(body).encode() if body else None
     headers = {
-        'Authorization': f'Bearer {_get_pat()}',
+        'Authorization': f'Bearer {bearer or _get_pat()}',
         'Content-Type': 'application/json',
         'Accept': 'application/json',
     }
@@ -220,6 +342,8 @@ def _request(method: str, path: str, body: dict | None = None, params: dict | No
             body_text = e.read().decode()
         except Exception:
             pass
+        if e.code in soft_errors:
+            raise _SoftHTTPError(e.code, body_text) from None
         if e.code == 401:
             _err('Authentication failed (401). Check your PAT token.')
         elif e.code == 403:
@@ -239,6 +363,10 @@ def _request(method: str, path: str, body: dict | None = None, params: dict | No
             scope_hint = ''
             if '/pm/' in path:
                 scope_hint = ' Add pm:write scope to your PAT.'
+            elif '/workforce/' in path:
+                scope_hint = (' Needs a schedule capability (can_manage_all/location/team_schedule) on'
+                              ' the seat. (workforce:read/workforce:write PAT scopes are not yet'
+                              ' available on servers - use seat login: `aeg --auth login`.)')
             if detail and _SCOPE_IN_DETAIL_RE.search(str(detail)):
                 _err(f'Permission denied (403): {_sanitize_inline(str(detail))}')
             if detail:
@@ -293,12 +421,17 @@ def _put(path: str, body: dict | None = None) -> dict | list:
 # be able to mint or revoke tokens (privilege escalation). So token management
 # mirrors the web UI - obtain a short-lived JWT via password login and use it
 # for that one request. The password is NEVER stored: it comes from a getpass
-# prompt or $TARK_PASSWORD (for automation), and the JWT lives in memory for the
+# prompt or an env var (see _login_password), and the JWT lives in memory for the
 # request lifetime only. Do NOT write a password to config or any file.
 # ---------------------------------------------------------------------------
 
 def _jwt_login(username: str, password: str) -> str:
     """POST /api/v1/auth/ (SimpleJWT PasswordTokenObtainPairView) -> access JWT."""
+    return _jwt_login_payload(username, password)['access']
+
+
+def _jwt_login_payload(username: str, password: str) -> dict:
+    """The full login response: {access, refresh, user: {..., permissions}}."""
     base = _get_url().rstrip('/')
     data = json.dumps({'username': username, 'password': password}).encode()
     req = urllib.request.Request(
@@ -312,13 +445,15 @@ def _jwt_login(username: str, password: str) -> str:
     except urllib.error.HTTPError as e:
         if e.code in (400, 401):
             _err('Login failed (bad username or password).')
+        if e.code == 429:
+            _err('Login throttled (429) - too many attempts; wait a minute and retry.')
         _err(f'Login failed: HTTP {e.code}')
     except urllib.error.URLError as e:
         _err(f'Login connection failed: {e.reason}')
     access = payload.get('access') if isinstance(payload, dict) else None
     if not access:
         _err('Login succeeded but returned no access token.')
-    return access
+    return payload
 
 
 def _jwt_request(method: str, path: str, access: str, body: dict | None = None) -> dict | list:
@@ -355,27 +490,77 @@ def _jwt_request(method: str, path: str, access: str, body: dict | None = None) 
         _err(f'Connection failed: {e.reason}')
 
 
+def _password_env_names(default_envs: tuple[str, ...]) -> tuple[list[str], str]:
+    """(env var names to try in order, remedy text when the list is empty).
+
+    A password is only offered to the host it belongs to:
+    * --password-env VAR: exactly that var, for whatever host the run targets.
+    * --url to a host that is NOT the selected target's own host (the profile's
+      url, else the default C2 url): nothing - no stored or env password follows.
+    * --profile P: its `password_env` (sealed); without one, $TARK_AEG_PASSWORD
+      only when P points at the default target's host - a profile on any other
+      host needs its own `password_env`.
+    * default (C2) target: `default_envs`, in order."""
+    if _PASSWORD_ENV_OVERRIDE:
+        return [_PASSWORD_ENV_OVERRIDE], ''
+    prof = _profile_cfg()
+    own_url = prof.get('url', '') if prof is not None else _default_url()
+    if _URL_OVERRIDE and not _same_host(_URL_OVERRIDE, own_url):
+        owner = f"profile {_PROFILE!r}'s" if prof is not None else "the default target's"
+        return [], (f'--url host {_url_host(_URL_OVERRIDE)[0]!r} is not {owner} host - no stored or env '
+                    'password is sent to it. Pass --password-env VAR (or run interactively).')
+    if prof is not None:
+        if prof.get('password_env'):
+            return [prof['password_env']], ''
+        if _same_host(prof.get('url', ''), _default_url()):
+            return ['TARK_AEG_PASSWORD'], ''
+        return [], (f'Profile {_PROFILE!r} is on another host than the default target and has no '
+                    f'`password_env` - $TARK_AEG_PASSWORD is not sent to it. Set one with:\n'
+                    f'  tark_cli --profile {_PROFILE} config set password_env TARK_{_PROFILE.upper()}_PASSWORD')
+    return [n for n in default_envs if n], ''
+
+
+def _login_password(default_envs: tuple[str, ...], prompt: bool = True, user: str = '') -> str:
+    """The ONE password resolver for every web login (tokens + aeg seat login).
+
+    Env vars only (see _password_env_names for which var may reach which host),
+    else a getpass prompt - NEVER read from or written to a file.
+    $TARK_PASSWORD is the default C2 password: it is only ever in `default_envs`,
+    so it never reaches a profile's or an overridden host.
+    prompt=False returns '' instead of prompting (opportunistic callers).
+    The prompt names the receiving host (and `user`) so a password is never typed
+    without seeing which server gets it."""
+    env_names, remedy = _password_env_names(default_envs)
+    for env_name in env_names:
+        if os.environ.get(env_name):
+            return os.environ[env_name]
+    if not prompt:
+        return ''
+    if not sys.stdin.isatty():
+        if remedy:
+            _err(remedy)
+        _err(f'No password - export ${env_names[0]} for non-interactive use '
+             '(never store a password in a file).')
+    host, port = _url_host(_get_url())
+    where = f'{host}:{port}' if port not in (None, 80, 443) else host
+    return getpass.getpass(f'Password for {user}@{where}: ' if user else f'Password for {where}: ')
+
+
 def _resolve_login(args) -> tuple[str, str]:
     """Return (username, password) for web login.
 
-    Username: --user > config `user` key > interactive prompt.
-    Password: $TARK_PASSWORD > getpass prompt. NEVER read from or written to any
-    file - the env var is the automation escape hatch (keep it in your shell's
-    secret store, never inline it in a script).
+    Username: --user > config `user` key (profile-aware) > interactive prompt.
+    Password: _login_password - $TARK_PASSWORD on the default C2 target only;
+    a profile / --url host gets only the password that belongs to that host.
     """
-    username = getattr(args, 'user', None) or _load_config().get('user', '')
+    username = getattr(args, 'user', None) or _cfg_get('user', '')
     if not username:
         if not sys.stdin.isatty():
             _err('No username - pass --user, or `tark_cli config set user <name>`.')
         username = input('Username: ').strip()
     if not username:
         _err('Username is required for token management.')
-    password = os.environ.get('TARK_PASSWORD', '')
-    if not password:
-        if not sys.stdin.isatty():
-            _err('No password - set $TARK_PASSWORD for non-interactive use '
-                 '(never store a password in a file).')
-        password = getpass.getpass('Password: ')
+    password = _login_password(('TARK_PASSWORD',), user=username)
     if not password:
         _err('Password is required for token management.')
     return username, password
@@ -414,6 +599,12 @@ _SCOPE_CAPABILITIES = {
     'sales:read':  'Read leads, pipelines, pipeline stages, contract types/blocks/templates',
     'sales:write': 'Create/update leads, offers, offer-lines, contracts, clients, email drafts',
     'users:read':  'Read the tenant user roster',
+    # workforce:* - the client path exists, but NO server ships the PAT schedule API
+    # yet (parked); `aeg` uses seat login. Labelled so nobody mints a dead token.
+    'workforce:read':  '[not yet available on servers] Read the schedule grid (employees, shifts, '
+                       'locations, planned shifts)',
+    'workforce:write': '[not yet available on servers] Set/replace/delete planned shifts (owner must '
+                       'hold a schedule capability)',
 }
 
 
@@ -2931,10 +3122,11 @@ def _tokens_list(args):
 
 def _tokens_scopes(args):
     """Show the scope -> capability map. Also fetches the deployment's live
-    available-scopes set when --user + $TARK_PASSWORD are present (no prompt)."""
+    available-scopes set when a user + a password env var are present (no prompt;
+    the password via _login_password, so $TARK_PASSWORD only for the default target)."""
     live = None
-    username = getattr(args, 'user', None) or _load_config().get('user', '')
-    password = os.environ.get('TARK_PASSWORD', '')
+    username = getattr(args, 'user', None) or _cfg_get('user', '')
+    password = _login_password(('TARK_PASSWORD',), prompt=False) if username else ''
     if username and password:
         access = _jwt_login(username, password)
         data = _jwt_request('GET', '/api/v1/pat/tokens/available-scopes/', access)
@@ -2957,8 +3149,8 @@ def _tokens_scopes(args):
     ]
     _table(['Scope', 'On deploy', 'Enables'], rows)
     if live is None:
-        print('\n  (static map - set --user + $TARK_PASSWORD to also show '
-              'deployment-available scopes)')
+        print('\n  (static map - set --user + $TARK_PASSWORD (or, under --profile/--url, the '
+              'profile password_env / --password-env) to also show deployment-available scopes)')
     print()
 
 
@@ -3011,17 +3203,1436 @@ def _tokens_revoke(args):
 
 
 # ---------------------------------------------------------------------------
+# Commands: Aeg (Workforce schedules) - `tark_cli aeg ...`
+#
+# Two ways in, resolved ONCE per run by _aeg_session (`aeg --auth auto|pat|login`):
+#
+#  * pat   - /api/v1/pat/workforce/ (workforce:read / workforce:write PAT scopes -
+#            NOT YET AVAILABLE ON SERVERS, the PAT schedule API is parked; the
+#            path stays for when it ships). `auto` probes it once and falls
+#            back to `login` on a 404 (server predates the PAT surface).
+#  * login - seat login: POST /api/v1/auth/ (the SPA's password login) -> JWT,
+#            renewed via /api/v1/auth/refresh/ on a 401, then the SAME endpoints
+#            the web schedule editors call under /api/v1/workforce/:
+#              all       schedule-grid/            (+ /save/, schedule-instances/save/)
+#              location  location-schedule-grid/   (+ /save/, location-schedule-instances/save/)
+#              team      team-schedule-grid/       (+ /save/, team-schedule-instances/save/)
+#            The editor family is picked from the seat's capabilities (superuser /
+#            can_manage_all_schedules -> all, else probed location -> team -> all).
+#            The password comes from the environment (see _password_env_names:
+#            --password-env VAR wins; a --url host other than the target's own
+#            gets none; under --profile the profile's `password_env`, else
+#            $TARK_AEG_PASSWORD only on the default target's host; $TARK_PASSWORD
+#            only for the default C2 target) or a prompt, and is
+#            kept in memory only - never written anywhere. The JWT pair (not the
+#            password) is cached in ~/.config/tark/aeg-sessions.json (0600) so
+#            a run of commands logs in ONCE - the login endpoint is throttled
+#            (10/min) and refresh is not. `aeg --relogin` drops the cache.
+#
+# Either way the seat must hold a schedule capability; the widest one held
+# (all > location > team) decides which employees the grid shows and which
+# cells a write may touch. Out-of-scope targets come back as `blocked`.
+#
+# Write path: *instances/save/ (location-aware, can replace/delete any planned
+# row by id, fires NO "schedule.published"; each changed cell records a
+# ScheduleChangeEvent the employee digest batches). If the seat lacks the
+# Plan/Actual capability that path 403s and the write ABORTS - unless the user
+# passed --legacy-save, which uses the Graafik *grid/save/ instead (location-less
+# rows only; ONE "schedule.published" per month per call - never per cell).
+# Every write is batched per month.
+# ---------------------------------------------------------------------------
+
+AEG_PREFIX = '/api/v1/pat/workforce'
+AEG_WEB_PREFIX = '/api/v1/workforce'
+_AEG_PATHS = {
+    'pat': {'grid': 'schedule-grid/', 'grid_save': 'schedule-grid/save/',
+            'instances_save': 'schedule-instances/save/'},
+    'all': {'grid': 'schedule-grid/', 'grid_save': 'schedule-grid/save/',
+            'instances_save': 'schedule-instances/save/'},
+    'location': {'grid': 'location-schedule-grid/', 'grid_save': 'location-schedule-grid/save/',
+                 'instances_save': 'location-schedule-instances/save/'},
+    'team': {'grid': 'team-schedule-grid/', 'grid_save': 'team-schedule-grid/save/',
+             'instances_save': 'team-schedule-instances/save/'},
+}
+_AEG_ARGS = None  # set by cmd_aeg (carries --auth / --user)
+_AEG_SESSION: dict = {}
+AEG_TZ = 'Europe/Tallinn'
+_AEG_GRID_CACHE: dict = {}
+_AEG_WEEKDAYS_ET = ['E', 'T', 'K', 'N', 'R', 'L', 'P']
+
+
+def _aeg_parse_date(raw: str, flag: str = 'date') -> date:
+    raw = (raw or '').strip()
+    for fmt in ('%Y-%m-%d', '%d.%m.%Y'):
+        try:
+            return datetime.strptime(raw, fmt).date()
+        except ValueError:
+            continue
+    _err(f'Invalid --{flag} {raw!r}: use YYYY-MM-DD (or DD.MM.YYYY).')
+
+
+def _aeg_range(args, default_days: int = 7) -> tuple[date, date]:
+    """Resolve --date / --from/--to / --month / --week into an inclusive range.
+    A repeated --date gives the span first..last (for fetching only) - commands
+    that act on rows narrow back to the given days with _aeg_explicit_dates."""
+    if getattr(args, 'date', None):
+        dates = sorted(_aeg_parse_date(d) for d in args.date)
+        if (dates[-1] - dates[0]).days > 92:
+            _err('--date values span more than 3 months - split the command.')
+        return dates[0], dates[-1]
+    month = getattr(args, 'month', None)
+    if month:
+        m = re.match(r'^(\d{4})-(\d{1,2})$', month)
+        if not m:
+            _err('--month must be YYYY-MM.')
+        y, mo = int(m.group(1)), int(m.group(2))
+        start = date(y, mo, 1)
+        nxt = date(y + (mo == 12), mo % 12 + 1, 1)
+        return start, nxt - timedelta(days=1)
+    week = getattr(args, 'week', None)
+    if week:
+        m = re.match(r'^(\d{4})-W?(\d{1,2})$', week)
+        if not m:
+            _err('--week must be YYYY-Www (e.g. 2026-W41).')
+        start = date.fromisocalendar(int(m.group(1)), int(m.group(2)), 1)
+        return start, start + timedelta(days=6)
+    start = _aeg_parse_date(args.date_from, 'from') if getattr(args, 'date_from', None) else date.today()
+    end = _aeg_parse_date(args.date_to, 'to') if getattr(args, 'date_to', None) else start + timedelta(days=default_days - 1)
+    if end < start:
+        _err('--to is before --from.')
+    if (end - start).days > 92:
+        _err('Range is longer than 3 months - narrow it.')
+    return start, end
+
+
+def _aeg_explicit_dates(args) -> set[str] | None:
+    """The ISO days named by --date (repeatable), or None when a range was given."""
+    if getattr(args, 'date', None):
+        return {_aeg_parse_date(d).isoformat() for d in args.date}
+    return None
+
+
+def _aeg_months(start: date, end: date) -> list[tuple[int, int]]:
+    months, y, m = [], start.year, start.month
+    while (y, m) <= (end.year, end.month):
+        months.append((y, m))
+        y, m = y + (m == 12), m % 12 + 1
+    return months
+
+
+def _peek_pat() -> str:
+    """The PAT _get_pat would use, or '' - never exits (aeg's auto mode asks).
+    Under --url only an explicit --pat/--pat-env counts (see _get_pat)."""
+    if _PAT_OVERRIDE:
+        return _PAT_OVERRIDE
+    if _URL_OVERRIDE:
+        return ''
+    prof = _profile_cfg()
+    if prof is not None:
+        env_name = prof.get('pat_env', '')
+        return (os.environ.get(env_name, '') if env_name else '') or prof.get('pat', '')
+    return os.environ.get('TARK_PAT') or os.environ.get('C2_PAT', '') or _load_config().get('pat', '')
+
+
+def _aeg_password(user: str = '') -> str:
+    """Seat-login password for `aeg` - see _login_password for the precedence."""
+    return _login_password(('TARK_AEG_PASSWORD', _load_config().get('password_env', ''), 'TARK_PASSWORD'),
+                           user=user)
+
+
+AEG_SESSIONS_FILE = CONFIG_DIR / 'aeg-sessions.json'
+
+
+def _aeg_session_key(user: str) -> str:
+    return f'{_get_url().rstrip("/")}|{user}'
+
+
+def _aeg_cached_sessions() -> dict:
+    try:
+        data = json.loads(AEG_SESSIONS_FILE.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _aeg_store_session(sess: dict | None, user: str) -> None:
+    """Persist the JWT pair + resolved editor family (never the password); None drops it."""
+    data = _aeg_cached_sessions()
+    key = _aeg_session_key(user)
+    if sess is None:
+        if key not in data:
+            return
+        data.pop(key)
+    else:
+        data[key] = {k: sess[k] for k in ('access', 'refresh', 'mode') if sess.get(k)}
+    _write_private(AEG_SESSIONS_FILE, json.dumps(data, indent=2))
+
+
+def _aeg_login(sess: dict) -> None:
+    """(Re)login as the seat; keeps access + refresh + permissions in memory."""
+    if not sess.get('password'):
+        sess['password'] = _aeg_password(sess.get('user', ''))
+    payload = _jwt_login_payload(sess['user'], sess['password'])
+    sess['access'] = payload['access']
+    sess['refresh'] = payload.get('refresh', '')
+    user = payload.get('user') or {}
+    sess['is_superuser'] = bool(user.get('is_superuser'))
+    sess['permissions'] = set(user.get('permissions') or [])
+
+
+def _aeg_renew(sess: dict) -> None:
+    """Expired access JWT: refresh it (POST /api/v1/auth/refresh/), else log in again."""
+    if sess.get('refresh'):
+        req = urllib.request.Request(
+            f'{_get_url().rstrip("/")}/api/v1/auth/refresh/',
+            data=json.dumps({'refresh': sess['refresh']}).encode(),
+            headers={'Content-Type': 'application/json', 'Accept': 'application/json'}, method='POST')
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                payload = json.loads(resp.read().decode() or '{}')
+            if payload.get('access'):
+                sess['access'] = payload['access']
+                sess['refresh'] = payload.get('refresh') or sess['refresh']  # rotation-safe
+                _aeg_store_session(sess, sess['user'])
+                return
+        except (urllib.error.HTTPError, urllib.error.URLError, ValueError):
+            pass
+    _aeg_login(sess)
+    _aeg_store_session(sess, sess['user'])
+
+
+def _aeg_session() -> dict:
+    """Resolve once per run how `aeg` reaches the server (see the block comment)."""
+    if _AEG_SESSION:
+        return _AEG_SESSION
+    args = _AEG_ARGS
+    auth = (getattr(args, 'auth', None) or _cfg_get('aeg_auth', '') or 'auto').lower()
+    if auth not in ('auto', 'pat', 'login'):
+        _err(f'--auth {auth!r}: use auto, pat or login.')
+    today = date.today()
+    probe = {'year': today.year, 'month': today.month}
+    if auth == 'pat' or (auth == 'auto' and _peek_pat()):
+        try:
+            grid = _request('GET', f'{AEG_PREFIX}/schedule-grid/', params=probe,
+                            soft_errors=(404,) if auth == 'auto' else ())
+            _AEG_SESSION.update(auth='pat', prefix=AEG_PREFIX, paths=_AEG_PATHS['pat'])
+            _AEG_GRID_CACHE[(today.year, today.month)] = grid
+            return _AEG_SESSION
+        except _SoftHTTPError:
+            _warn('This server has no PAT schedule API (404) - using seat login instead.')
+    user = getattr(args, 'user', None) or _cfg_get('user', '') or os.environ.get('TARK_AEG_USER', '')
+    if not user:
+        _err('Seat login needs a username: `aeg --user <username>`, '
+             '`tark_cli --profile <p> config set user <username>` or $TARK_AEG_USER.')
+    sess = {'auth': 'login', 'user': user, 'prefix': AEG_WEB_PREFIX}
+    if getattr(args, 'relogin', False):
+        _aeg_store_session(None, user)
+    cached = _aeg_cached_sessions().get(_aeg_session_key(user)) or {}
+    if cached.get('access') and cached.get('mode') in _AEG_PATHS:
+        # Re-use the last login; an expired access token is renewed on its 401.
+        _AEG_SESSION.update(sess, access=cached['access'], refresh=cached.get('refresh', ''),
+                            mode=cached['mode'], paths=_AEG_PATHS[cached['mode']])
+        return _AEG_SESSION
+    _aeg_login(sess)
+    _AEG_SESSION.update(sess)
+    # Which editor family: the tenant-wide one for an all-schedules manager, else
+    # probe the scoped ones. The tenant-wide GET also admits Plan/Actual VIEWERS,
+    # so it is tried last; its writes then 403 server-side (permissions stay there).
+    if sess['is_superuser'] or 'core.can_manage_all_schedules' in sess['permissions']:
+        modes = ['all']
+    else:
+        modes = ['location', 'team', 'all']
+    for mode in modes:
+        _AEG_SESSION.update(mode=mode, paths=_AEG_PATHS[mode])
+        try:
+            grid = _aeg_call('GET', 'grid', params=probe, soft_errors=(403,))
+        except _SoftHTTPError:
+            continue
+        _AEG_GRID_CACHE[(today.year, today.month)] = dict(grid, scope=grid.get('scope') or mode)
+        _aeg_store_session(_AEG_SESSION, user)
+        return _AEG_SESSION
+    _err(f'Seat {user!r} has no schedule capability (manage all / location / team schedules, '
+         'or the Plan/Actual viewer) - grant it in Tark, the CLI cannot widen it.')
+
+
+def _aeg_call(method: str, kind: str, body: dict | None = None, params: dict | None = None,
+              soft_errors: tuple = ()) -> dict | list:
+    """One schedule request through the resolved session. kind: grid | grid_save | instances_save."""
+    sess = _aeg_session()
+    path = f'{sess["prefix"]}/{sess["paths"][kind]}'
+    if sess['auth'] == 'pat':
+        return _request(method, path, body=body, params=params, soft_errors=soft_errors)
+    for attempt in (1, 2):
+        try:
+            return _request(method, path, body=body, params=params, bearer=sess['access'],
+                            soft_errors=tuple(soft_errors) + (401,))
+        except _SoftHTTPError as e:
+            if e.code != 401:
+                raise
+            if attempt == 2:
+                _err(f'Seat login for {sess["user"]!r} was rejected (401) even after renewing it.')
+            _aeg_renew(sess)
+
+
+def _aeg_grid(year: int, month: int, refresh: bool = False) -> dict:
+    key = (year, month)
+    if refresh or key not in _AEG_GRID_CACHE:
+        data = _aeg_call('GET', 'grid', params={'year': year, 'month': month})
+        if not isinstance(data, dict) or 'rows' not in data:
+            _err(f'Unexpected schedule-grid response for {year}-{month:02d}.')
+        if _AEG_SESSION.get('auth') == 'login':
+            data = dict(data, scope=data.get('scope') or _AEG_SESSION['mode'])
+        _AEG_GRID_CACHE[key] = data
+    return _AEG_GRID_CACHE[key]
+
+
+def _aeg_tz():
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(AEG_TZ)
+    except Exception:  # pragma: no cover - tzdata missing: fall back to UTC
+        return None
+
+
+def _aeg_local(iso: str | None) -> datetime | None:
+    """Server ISO timestamp -> naive local (Europe/Tallinn) datetime."""
+    if not iso:
+        return None
+    dt = datetime.fromisoformat(iso.replace('Z', '+00:00'))
+    if dt.tzinfo is not None:
+        tz = _aeg_tz()
+        dt = dt.astimezone(tz) if tz else dt
+        dt = dt.replace(tzinfo=None)
+    return dt
+
+
+def _aeg_catalog(start: date, end: date) -> dict:
+    """Employees, shifts and locations visible to this token, merged across the
+    months of [start, end]."""
+    employees: dict[int, dict] = {}
+    shifts: dict[int, dict] = {}
+    locations: dict[int, str] = {}
+    scope = ''
+    for y, m in _aeg_months(start, end):
+        grid = _aeg_grid(y, m)
+        scope = grid.get('scope', scope)
+        for loc in grid.get('manager_locations') or []:
+            locations[loc['id']] = loc['name']
+        for sh in grid.get('shift_hours') or []:
+            shifts[sh['id']] = sh
+            if sh.get('location_id'):
+                locations.setdefault(sh['location_id'], sh.get('location_name') or '')
+        for row in grid['rows']:
+            if row.get('location_id'):
+                locations.setdefault(row['location_id'], row.get('location_name') or '')
+            emp = employees.setdefault(row['user_id'], {
+                'user_id': row['user_id'],
+                'name': row.get('display_name') or row.get('username') or str(row['user_id']),
+                'username': row.get('username', ''),
+                'group': row.get('group_name') or '',
+                'location_id': row.get('location_id'),
+                'location': row.get('location_name') or '',
+                'role_locations': {},
+                'contract_type': row.get('contract_type') or '',
+                'is_active': row.get('is_active', True),
+            })
+            for loc_id, role in (row.get('location_roles') or {}).items():
+                emp['role_locations'][int(loc_id)] = role.get('name', '')
+    for emp in employees.values():
+        names = {emp['location']} | {locations.get(i, '') for i in emp['role_locations']}
+        emp['locations'] = sorted(n for n in names if n)
+        emp['roles'] = sorted({r for r in emp['role_locations'].values() if r} | ({emp['group']} if emp['group'] else set()))
+    for sh in shifts.values():
+        ids = sh.get('locations') or ([sh['location_id']] if sh.get('location_id') else [])
+        sh['location_names'] = sorted(locations.get(i, str(i)) for i in ids)
+    return {'employees': employees, 'shifts': shifts, 'locations': locations, 'scope': scope}
+
+
+def _aeg_match(needle: str | None, *haystacks) -> bool:
+    if not needle:
+        return True
+    n = needle.casefold()
+    for h in haystacks:
+        if isinstance(h, (list, tuple, set)):
+            if any(n in str(x).casefold() for x in h):
+                return True
+        elif h and n in str(h).casefold():
+            return True
+    return False
+
+
+def _aeg_filter_employees(cat: dict, args) -> list[dict]:
+    out = []
+    for emp in cat['employees'].values():
+        if not _aeg_match(getattr(args, 'department', None), emp['locations'], emp['roles']):
+            continue
+        if not _aeg_match(getattr(args, 'location', None), emp['locations']):
+            continue
+        if not _aeg_match(getattr(args, 'role', None), emp['roles']):
+            continue
+        if not _aeg_match(getattr(args, 'search', None), emp['name'], emp['username']):
+            continue
+        out.append(emp)
+    return sorted(out, key=lambda e: (e['location'], e['name']))
+
+
+def _aeg_resolve(kind: str, ref, items: list[dict], label) -> dict:
+    """Resolve an id / exact label / unique substring to one item, or exit."""
+    ref_s = str(ref).strip()
+    if ref_s.isdigit():
+        for it in items:
+            if it['_id'] == int(ref_s):
+                return it
+    exact = [it for it in items if any(ref_s.casefold() == lab.casefold() for lab in label(it) if lab)]
+    if len(exact) == 1:
+        return exact[0]
+    pool = exact or [it for it in items if any(ref_s.casefold() in lab.casefold() for lab in label(it) if lab)]
+    if len(pool) == 1:
+        return pool[0]
+    if not pool:
+        _err(f'No {kind} matches {ref_s!r}. List them with `tark_cli aeg {kind}s`.')
+    names = '; '.join(f'{it["_id"]}={label(it)[0]}' for it in pool[:10])
+    _err(f'{kind.capitalize()} {ref_s!r} is ambiguous: {names}. Use the id.')
+
+
+def _aeg_employee(cat: dict, ref) -> dict:
+    items = [dict(e, _id=e['user_id']) for e in cat['employees'].values()]
+    return _aeg_resolve('employee', ref, items, lambda e: [e['name'], e['username']])
+
+
+def _aeg_shift(cat: dict, ref, location: str | None = None) -> dict:
+    items = [dict(s, _id=s['id']) for s in cat['shifts'].values()]
+    if location:
+        scoped = [s for s in items if _aeg_match(location, s['location_names'])]
+        items = scoped or items
+    return _aeg_resolve('shift', ref, items, lambda s: [s['name'], s.get('acronym') or ''])
+
+
+def _aeg_location_id(cat: dict, ref) -> int:
+    items = [{'_id': i, 'name': n} for i, n in cat['locations'].items()]
+    return _aeg_resolve('location', ref, items, lambda loc: [loc['name']])['_id']
+
+
+def _aeg_department_locations(cat: dict, needle: str) -> set[int]:
+    """Location ids a --department needle stands for: locations whose name matches,
+    the locations where a matching role is held, and the home location of a
+    matching role group (the same three ways _aeg_filter_employees matches people)."""
+    locs = {i for i, n in cat['locations'].items() if _aeg_match(needle, n)}
+    for emp in cat['employees'].values():
+        locs |= {i for i, role in emp['role_locations'].items() if _aeg_match(needle, role)}
+        if emp['group'] and _aeg_match(needle, emp['group']) and emp.get('location_id'):
+            locs.add(emp['location_id'])
+    return locs
+
+
+def _aeg_row_at(cat: dict, row: dict, locs: set[int]) -> bool:
+    """Is a planned row at one of `locs`? A location-less row (the Graafik grid-save
+    fallback writes those) counts as its employee's home location."""
+    if row.get('location_id'):
+        return row['location_id'] in locs
+    return cat['employees'].get(row['user_id'], {}).get('location_id') in locs
+
+
+def _aeg_entries(start: date, end: date) -> list[dict]:
+    """Every planned shift (and absence) in [start, end] from the server grid."""
+    out = []
+    for y, m in _aeg_months(start, end):
+        grid = _aeg_grid(y, m)
+        for row in grid['rows']:
+            for day_key, cell in (row.get('days') or {}).items():
+                d = date(y, m, int(day_key))
+                if d < start or d > end:
+                    continue
+                for inst in cell.get('planned') or []:
+                    out.append({
+                        'date': d.isoformat(),
+                        'user_id': row['user_id'],
+                        'employee': row.get('display_name') or row.get('username'),
+                        'id': inst.get('id'),
+                        'client_id': inst.get('client_id'),
+                        'shift_id': inst.get('shift_hour_id'),
+                        'shift': inst.get('shift_name') or '',
+                        'location_id': inst.get('location_id'),
+                        'location': inst.get('location_name') or '',
+                        'starts_at': inst.get('starts_at'),
+                        'ends_at': inst.get('ends_at'),
+                        'hours': inst.get('hours'),
+                    })
+                if cell.get('absence'):
+                    out.append({
+                        'date': d.isoformat(),
+                        'user_id': row['user_id'],
+                        'employee': row.get('display_name') or row.get('username'),
+                        'absence': cell['absence'],
+                    })
+    return sorted(out, key=lambda e: (e['date'], e['employee'] or '', e.get('starts_at') or ''))
+
+
+def _aeg_hhmm(iso: str | None) -> str:
+    dt = _aeg_local(iso)
+    return dt.strftime('%H:%M') if dt else ''
+
+
+# --- read commands ---------------------------------------------------------
+
+def _aeg_month_range(args) -> tuple[date, date]:
+    if getattr(args, 'month', None):
+        return _aeg_range(args)
+    today = date.today()
+    return today, today
+
+
+def cmd_aeg_employees(args):
+    start, end = _aeg_month_range(args)
+    cat = _aeg_catalog(start, end)
+    emps = _aeg_filter_employees(cat, args)
+    if args.json:
+        _json_out([{k: v for k, v in e.items() if k != 'role_locations'} for e in emps])
+        return
+    print(f'\n  EMPLOYEES ({len(emps)}) - scope: {cat["scope"] or "?"}\n')
+    _table(['ID', 'Name', 'Location', 'Role / group', 'Contract'],
+           [[e['user_id'], e['name'], ', '.join(e['locations']), ', '.join(e['roles']),
+             e['contract_type']] for e in emps])
+    print()
+
+
+def cmd_aeg_shifts(args):
+    start, end = _aeg_month_range(args)
+    cat = _aeg_catalog(start, end)
+    loc_filter = getattr(args, 'location', None) or getattr(args, 'department', None)
+    shifts = [s for s in cat['shifts'].values() if _aeg_match(loc_filter, s['location_names'])]
+    shifts.sort(key=lambda s: (s['location_names'], s.get('start_time') or ''))
+    if args.json:
+        _json_out(shifts)
+        return
+    print(f'\n  SHIFTS ({len(shifts)})\n')
+    _table(['ID', 'Name', 'Code', 'Time', 'Locations'],
+           [[s['id'], s['name'], s.get('acronym') or '',
+             f'{s.get("start_time") or "?"}-{s.get("end_time") or "?"}',
+             ', '.join(s['location_names'])] for s in shifts])
+    print()
+
+
+def cmd_aeg_locations(args):
+    start, end = _aeg_month_range(args)
+    cat = _aeg_catalog(start, end)
+    counts: dict[str, int] = {}
+    for e in cat['employees'].values():
+        for loc in e['locations']:
+            counts[loc] = counts.get(loc, 0) + 1
+    rows = [{'id': i, 'name': n, 'employees': counts.get(n, 0),
+             'shifts': sum(1 for s in cat['shifts'].values() if n in s['location_names'])}
+            for i, n in sorted(cat['locations'].items(), key=lambda kv: kv[1])]
+    if args.json:
+        _json_out(rows)
+        return
+    print(f'\n  LOCATIONS / DEPARTMENTS ({len(rows)}) - scope: {cat["scope"] or "?"}\n')
+    _table(['ID', 'Name', 'Employees', 'Shifts'],
+           [[r['id'], r['name'], r['employees'], r['shifts']] for r in rows])
+    print()
+
+
+def cmd_aeg_departments(args):
+    """Role groups (the schedule editor's row groups) with headcount."""
+    start, end = _aeg_month_range(args)
+    cat = _aeg_catalog(start, end)
+    groups: dict[tuple[str, str], int] = {}
+    for e in cat['employees'].values():
+        key = (e['location'], e['group'] or '-')
+        groups[key] = groups.get(key, 0) + 1
+    rows = [{'location': k[0], 'group': k[1], 'employees': v} for k, v in sorted(groups.items())]
+    if args.json:
+        _json_out(rows)
+        return
+    print(f'\n  DEPARTMENTS / ROLE GROUPS ({len(rows)})\n')
+    _table(['Location', 'Group', 'Employees'], [[r['location'], r['group'], r['employees']] for r in rows])
+    print()
+
+
+def _aeg_selected_users(cat: dict, args) -> set[int] | None:
+    """User ids selected by --employee/--department/--location/--role, or None for all."""
+    emps = getattr(args, 'employee', None) or []
+    if emps:
+        return {_aeg_employee(cat, ref)['user_id'] for ref in emps}
+    if any(getattr(args, k, None) for k in ('department', 'location', 'role')):
+        return {e['user_id'] for e in _aeg_filter_employees(cat, args)}
+    return None
+
+
+def cmd_aeg_schedule_get(args):
+    start, end = _aeg_range(args)
+    only = _aeg_explicit_dates(args)  # --date d1 --date d2: just those days, not d1..d2
+    cat = _aeg_catalog(start, end)
+    users = _aeg_selected_users(cat, args)
+    entries = [e for e in _aeg_entries(start, end)
+               if (users is None or e['user_id'] in users) and (only is None or e['date'] in only)]
+    if getattr(args, 'shift', None):
+        sh = _aeg_shift(cat, args.shift, getattr(args, 'location', None))
+        entries = [e for e in entries if e.get('shift_id') == sh['id']]
+    if args.json:
+        _json_out(entries)
+        return
+    dates = [start + timedelta(days=i) for i in range((end - start).days + 1)]
+    if only is not None:
+        dates = [d for d in dates if d.isoformat() in only]
+    fmt = getattr(args, 'format', None) or ('grid' if len(dates) <= 14 else 'list')
+    span = ', '.join(sorted(only)) if only else f'{start.isoformat()} .. {end.isoformat()}'
+    print(f'\n  SCHEDULE {span} - scope: {cat["scope"] or "?"}\n')
+    if fmt == 'list':
+        _table(['Date', 'Employee', 'Shift', 'Time', 'Location'],
+               [[e['date'], e['employee'], e.get('shift') or f'[{e.get("absence")}]',
+                 f'{_aeg_hhmm(e.get("starts_at"))}-{_aeg_hhmm(e.get("ends_at"))}' if e.get('starts_at') else '',
+                 e.get('location', '')] for e in entries])
+        print(f'\n  {sum(1 for e in entries if e.get("shift_id"))} shifts\n')
+        return
+    codes = {s['id']: (s.get('acronym') or s['name'][:6]) for s in cat['shifts'].values()}
+    by_user: dict[int, dict[str, list[str]]] = {}
+    for e in entries:
+        cell = by_user.setdefault(e['user_id'], {}).setdefault(e['date'], [])
+        cell.append(codes.get(e.get('shift_id'), e.get('shift') or '?') if e.get('shift_id') else f'[{e["absence"]}]')
+    names = {u: cat['employees'][u]['name'] for u in by_user if u in cat['employees']}
+    if users is not None:
+        for u in users:
+            by_user.setdefault(u, {})
+            names.setdefault(u, cat['employees'].get(u, {}).get('name', str(u)))
+    headers = ['Employee'] + [f'{_AEG_WEEKDAYS_ET[d.weekday()]} {d.day:02d}.{d.month:02d}' for d in dates] + ['h']
+    rows = []
+    for uid in sorted(by_user, key=lambda u: names.get(u, '')):
+        hours = sum((e.get('hours') or 0) for e in entries if e['user_id'] == uid and e.get('shift_id'))
+        rows.append([names.get(uid, uid)] + ['+'.join(by_user[uid].get(d.isoformat(), [])) or '.' for d in dates]
+                    + [f'{hours:g}'])
+    _table(headers, rows)
+    legend = sorted({(codes[s], cat['shifts'][s]['name']) for s in codes
+                     if any(e.get('shift_id') == s for e in entries)})
+    if legend:
+        print('\n  ' + '  '.join(f'{c}={n}' for c, n in legend))
+    print()
+
+
+# --- plan model ------------------------------------------------------------
+
+def _aeg_load_plan(path: str) -> dict:
+    """Plan file: JSON {location?, rules?, assignments: [{employee, date, shift,
+    location?}]} (or a bare list), or CSV with header employee,date,shift[,location].
+    `shift: null` / empty clears that employee's day at the entry's location, else the
+    plan's `location`, else the employee's home location - never at any other location."""
+    p = Path(path)
+    if not p.exists():
+        _err(f'Plan file not found: {path}')
+    text = p.read_text(encoding='utf-8')
+    if p.suffix.lower() == '.csv':
+        import csv
+        rows = list(csv.DictReader(text.splitlines()))
+        missing = {'employee', 'date'} - set(rows[0].keys() if rows else [])
+        if missing:
+            _err(f'CSV plan needs columns employee,date,shift[,location]; missing {sorted(missing)}.')
+        return {'assignments': [{k: (v or None) for k, v in r.items()} for r in rows]}
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        _err(f'Plan file is not valid JSON: {e}')
+    if isinstance(data, list):
+        data = {'assignments': data}
+    if not isinstance(data, dict) or not isinstance(data.get('assignments'), list):
+        _err('Plan JSON must be a list or an object with an "assignments" list.')
+    return data
+
+
+def _aeg_shift_window(sh: dict, d: date) -> tuple[datetime, datetime]:
+    st = datetime.strptime(sh.get('start_time') or '00:00', '%H:%M').time()
+    en = datetime.strptime(sh.get('end_time') or '00:00', '%H:%M').time()
+    s_dt = datetime.combine(d, st)
+    e_dt = datetime.combine(d, en)
+    if e_dt <= s_dt:
+        e_dt += timedelta(days=1)
+    return s_dt, e_dt
+
+
+def _aeg_pick_location(cat: dict, sh: dict, emp: dict, plan_loc: int | None) -> int | None:
+    allowed = list(sh.get('locations') or ([sh['location_id']] if sh.get('location_id') else []))
+    if plan_loc is not None:
+        if allowed and plan_loc not in allowed:
+            _err(f'Shift {sh["name"]!r} is not allowed at location {cat["locations"].get(plan_loc, plan_loc)!r} '
+                 f'(allowed: {", ".join(sh["location_names"]) or "nowhere"}).')
+        return plan_loc
+    if len(allowed) == 1:
+        return allowed[0]
+    emp_locs = [emp.get('location_id')] + list(emp.get('role_locations', {}))
+    for loc in emp_locs:
+        if loc in allowed:
+            return loc
+    return allowed[0] if allowed else None
+
+
+def _aeg_build_targets(cat: dict, plan: dict, clears: dict | None = None) -> dict:
+    """{(user_id, date_iso): [ {shift, location_id} ... ]} - [] clears the day.
+
+    A clear entry (`shift` null/empty) records where it clears into `clears`
+    {(user_id, date_iso): {location_id, ...}}: the entry's location, else the plan's
+    `location`, else the employee's home location (None when it has none - then
+    only location-less rows are cleared)."""
+    default_loc = plan.get('location')
+    targets: dict[tuple[int, str], list[dict]] = {}
+    for i, a in enumerate(plan['assignments'], 1):
+        if not isinstance(a, dict) or not a.get('employee') or not a.get('date'):
+            _err(f'Assignment #{i} needs "employee" and "date": {a!r}')
+        emp = _aeg_employee(cat, a['employee'])
+        d = _aeg_parse_date(str(a['date']))
+        key = (emp['user_id'], d.isoformat())
+        cell = targets.setdefault(key, [])
+        loc_ref = a.get('location') or default_loc
+        if not a.get('shift'):
+            if clears is not None:
+                clears.setdefault(key, set()).add(
+                    _aeg_location_id(cat, loc_ref) if loc_ref else emp.get('location_id'))
+            continue
+        loc_id = _aeg_location_id(cat, loc_ref) if loc_ref else None
+        sh = _aeg_shift(cat, a['shift'], loc_ref)
+        cell.append({'shift': sh, 'location_id': _aeg_pick_location(cat, sh, emp, loc_id), 'emp': emp})
+    return targets
+
+
+def _aeg_diff(cat: dict, targets: dict, existing: list[dict], prune_users: set | None = None,
+              prune_range: tuple[date, date] | None = None,
+              prune_locations: set[int] | None = None, clears: dict | None = None) -> list[dict]:
+    """Ops turning `existing` into `targets` per (employee, day) cell.
+
+    op: create | update (replace an existing row in place) | delete | keep.
+    Only rows at the plan's location(s) are ever replaced or deleted - on the
+    person-days the plan names AND in a prune. The plan's locations are
+    `prune_locations` when given, else every location its targets name. A
+    location-less row (Graafik grid-save fallback) counts as its employee's home
+    location; a plan with no location at all touches only location-less rows. So a
+    person's shift at a location the plan does not name is never touched - a plan
+    shift on that day is created beside it.
+    `clears` ({cell: {location_id | None}} from _aeg_build_targets) names the plan's
+    clear entries: their locations count as plan locations, and a clear-only cell
+    deletes only that day's rows at its clear location(s).
+    Prune (prune_users + prune_range) also deletes the plan employees' other
+    in-plan-location rows in the range."""
+    have: dict[tuple[int, str], list[dict]] = {}
+    for e in existing:
+        if e.get('shift_id'):
+            have.setdefault((e['user_id'], e['date']), []).append(e)
+    cells = set(targets)
+    clears = clears or {}
+    clear_locs = {loc for locs in clears.values() for loc in locs if loc}
+    plan_locs = (set(prune_locations) | clear_locs if prune_locations is not None
+                 else {t['location_id'] for cell in targets.values() for t in cell if t['location_id']} | clear_locs)
+
+    def _in_plan(row):
+        if not plan_locs:  # a plan with no location at all: only location-less rows
+            return not row.get('location_id')
+        return _aeg_row_at(cat, row, plan_locs)
+
+    if prune_users is not None and prune_range:
+        for (uid, d), rows in have.items():
+            if (uid in prune_users and prune_range[0].isoformat() <= d <= prune_range[1].isoformat()
+                    and any(_in_plan(r) for r in rows)):
+                cells.add((uid, d))
+    ops = []
+    for key in sorted(cells, key=lambda k: (k[1], cat['employees'].get(k[0], {}).get('name', ''))):
+        uid, d = key
+        want = list(targets.get(key, []))
+        rows = [r for r in have.get(key, []) if _in_plan(r)]  # other locations: never touched
+        if not want and key in clears:  # clear-only cell: only its clear location(s), all in plan_locs
+            locs = {loc for loc in clears[key] if loc}
+            rows = [r for r in have.get(key, []) if (locs and _aeg_row_at(cat, r, locs))
+                    or (None in clears[key] and not r.get('location_id'))]
+        name = cat['employees'].get(uid, {}).get('name', str(uid))
+        for t in list(want):
+            same = next((r for r in rows if r['shift_id'] == t['shift']['id']
+                         and r.get('location_id') == t['location_id']), None)
+            if same:
+                ops.append({'op': 'keep', 'user_id': uid, 'employee': name, 'date': d, 'row': same,
+                            'shift': t['shift'], 'location_id': t['location_id']})
+                rows.remove(same)
+                want.remove(t)
+        for t in want:
+            row = rows.pop(0) if rows else None
+            ops.append({'op': 'update' if row else 'create', 'user_id': uid, 'employee': name, 'date': d,
+                        'row': row, 'shift': t['shift'], 'location_id': t['location_id']})
+        for row in rows:
+            ops.append({'op': 'delete', 'user_id': uid, 'employee': name, 'date': d, 'row': row,
+                        'shift': None, 'location_id': row.get('location_id')})
+    return ops
+
+
+def _aeg_print_diff(cat: dict, ops: list[dict]) -> None:
+    sym = {'create': '+', 'update': '~', 'delete': '-', 'keep': '='}
+    rows = []
+    for o in ops:
+        old = o['row']['shift'] if o.get('row') else ''
+        new = o['shift']['name'] if o.get('shift') else ''
+        d = date.fromisoformat(o['date'])
+        loc = cat['locations'].get(o.get('location_id'), '') if o.get('location_id') else ''
+        rows.append([sym[o['op']], f'{_AEG_WEEKDAYS_ET[d.weekday()]} {o["date"]}', o['employee'],
+                     old if o['op'] != 'create' else '', new if o['op'] != 'delete' else '', loc])
+    _table(['', 'Date', 'Employee', 'Was', 'Becomes', 'Location'], rows)
+    n = {k: sum(1 for o in ops if o['op'] == k) for k in sym}
+    print(f'\n  {n["create"]} to create, {n["update"]} to replace, {n["delete"]} to delete, '
+          f'{n["keep"]} unchanged')
+
+
+# --- writes ----------------------------------------------------------------
+
+def _aeg_client_id(prefix: str, row: dict | None = None) -> str:
+    if row and row.get('client_id'):
+        return row['client_id']
+    import uuid
+    return f'cli-{prefix}-{row["id"]}' if row and row.get('id') else f'cli-{uuid.uuid4().hex[:24]}'
+
+
+_AEG_LEGACY_NOTE = ('--legacy-save: if the Plan/Actual save is refused (403), the Graafik save is used '
+                    'instead - one location-less shift per day, located rows are NOT deleted, and one '
+                    '"schedule.published" notification per month goes to the employees.')
+
+
+def _aeg_write(cat: dict, ops: list[dict], legacy_save: bool = False) -> dict:
+    """Send the ops, ONE request per month. Returns aggregated counts.
+
+    A 403 on the Plan/Actual save aborts (exit 1): the Graafik save writes
+    different data than the diff the user confirmed, so it runs only when the
+    user opted in with --legacy-save."""
+    todo = [o for o in ops if o['op'] != 'keep']
+    total = {'created': 0, 'updated': 0, 'deleted': 0, 'blocked': 0, 'dropped': [], 'path': 'instances'}
+    by_month: dict[tuple[int, int], list[dict]] = {}
+    for o in todo:
+        d = date.fromisoformat(o['date'])
+        by_month.setdefault((d.year, d.month), []).append(o)
+    for (y, m), month_ops in sorted(by_month.items()):
+        instances = []
+        for o in month_ops:
+            row = o.get('row')
+            inst = {'user_id': o['user_id'], 'date': o['date']}
+            if o['op'] == 'delete':
+                inst.update({'client_id': _aeg_client_id('del', row), 'id': row['id'], 'deleted': True})
+            else:
+                inst.update({'client_id': _aeg_client_id('adopt', row) if row else _aeg_client_id('new'),
+                             'shift_hour_id': o['shift']['id'], 'location_id': o['location_id']})
+                if row:
+                    inst['id'] = row['id']
+            instances.append(inst)
+        try:
+            res = _aeg_call('POST', 'instances_save',
+                            body={'year': y, 'month': m, 'instances': instances}, soft_errors=(403,))
+        except _SoftHTTPError:
+            if not legacy_save:
+                done = (f' Already written before the refusal: {total["created"]} created, '
+                        f'{total["updated"]} replaced, {total["deleted"]} deleted.'
+                        if (total['created'] or total['updated'] or total['deleted']) else ' Nothing was written.')
+                _err(f'Plan/Actual save refused (403) for {y}-{m:02d}: the seat lacks the Plan/Actual '
+                     f'capability.{done} Grant it in Tark, or re-run with --legacy-save to use the Graafik '
+                     'save (one location-less shift per day, located rows kept, notifies employees).')
+            res = _aeg_write_legacy(y, m, month_ops)
+            total['path'] = 'grid (--legacy-save)'
+        if isinstance(res, dict) and 'saved' in res:
+            sent_new = {i['client_id'] for i in instances if not i.get('deleted') and not i.get('id')}
+            for s in res.get('saved') or []:
+                total['created' if s.get('client_id') in sent_new else 'updated'] += 1
+            total['deleted'] += len(res.get('deleted') or [])
+        else:
+            for k in ('created', 'updated', 'deleted'):
+                total[k] += int(res.get(k, 0) or 0)
+        total['blocked'] += int(res.get('blocked', 0) or 0)
+        dropped = res.get('dropped')
+        if isinstance(dropped, list):
+            total['dropped'] += dropped
+        elif res.get('dropped_shift_at_location'):
+            total['dropped'].append({'reason': f'{res["dropped_shift_at_location"]} shift_not_allowed_at_location'})
+    return total
+
+
+def _aeg_write_legacy(y: int, m: int, month_ops: list[dict]) -> dict:
+    """--legacy-save path for owners without the Plan/Actual capability: schedule-grid/save/
+    writes ONE location-less row per cell and can only clear location-less rows."""
+    _warn('No Plan/Actual capability on the seat - --legacy-save: using the Graafik save '
+          '(one location-less shift per day; located rows are left untouched; '
+          'one "schedule.published" event for this month).')
+    cells: dict[tuple[int, int], int | None] = {}
+    for o in month_ops:
+        d = date.fromisoformat(o['date'])
+        key = (o['user_id'], d.day)
+        if o['op'] == 'delete':
+            if o['row'].get('location_id'):
+                _warn(f'  kept located row: {o["employee"]} {o["date"]} {o["row"]["shift"]}')
+                continue
+            cells.setdefault(key, None)
+        else:
+            if cells.get(key):
+                _warn(f'  {o["employee"]} {o["date"]}: only one shift per day on this path - kept the first')
+                continue
+            cells[key] = o['shift']['id']
+    body = {'year': y, 'month': m,
+            'assignments': [{'user_id': u, 'day': d, 'shift_hour_id': s} for (u, d), s in cells.items()]}
+    return _aeg_call('POST', 'grid_save', body=body)
+
+
+def _aeg_report_write(total: dict) -> None:
+    print(f'\n  Written via {total["path"]}: {total["created"]} created, {total["updated"]} replaced, '
+          f'{total["deleted"]} deleted')
+    if total['blocked']:
+        _warn(f'{total["blocked"]} employee(s) are outside your schedule scope - NOT written.')
+    for d in total['dropped']:
+        _warn(f'dropped: {d.get("client_id") or ""} {d.get("reason")}')
+
+
+# --- rule checks (client-side) ----------------------------------------------
+
+_AEG_DEFAULT_RULES = {'min_rest_hours': 11, 'max_consecutive_days': 5, 'max_consecutive_nights': None,
+                      'max_week_hours': 48, 'require': [], 'senior': []}
+
+
+def _aeg_rules(args, plan: dict | None = None) -> dict:
+    rules = dict(_AEG_DEFAULT_RULES)
+    if plan and isinstance(plan.get('rules'), dict):
+        rules.update(plan['rules'])
+    for flag, key in (('min_rest', 'min_rest_hours'), ('max_consecutive', 'max_consecutive_days'),
+                      ('max_nights', 'max_consecutive_nights'), ('max_week_hours', 'max_week_hours')):
+        val = getattr(args, flag, None)
+        if val is not None:
+            rules[key] = val
+    rules['require'] = list(rules.get('require') or []) + list(getattr(args, 'require', None) or [])
+    rules['senior'] = list(rules.get('senior') or []) + list(getattr(args, 'senior', None) or [])
+    return rules
+
+
+def _aeg_intervals(cat: dict, existing: list[dict], ops: list[dict] | None) -> dict[int, list[dict]]:
+    """Per-employee shift intervals (local time) after applying `ops` to `existing`."""
+    removed = {id(o['row']) for o in (ops or []) if o.get('row') and o['op'] in ('update', 'delete')}
+    out: dict[int, list[dict]] = {}
+    for e in existing:
+        if not e.get('shift_id') or id(e) in removed:
+            continue
+        s, en = _aeg_local(e.get('starts_at')), _aeg_local(e.get('ends_at'))
+        if s is None or en is None:
+            sh = cat['shifts'].get(e['shift_id'])
+            if not sh:
+                continue
+            s, en = _aeg_shift_window(sh, date.fromisoformat(e['date']))
+        out.setdefault(e['user_id'], []).append({'date': e['date'], 'shift_id': e['shift_id'],
+                                                 'shift': e['shift'], 'start': s, 'end': en})
+    for o in ops or []:
+        if o['op'] in ('create', 'update'):
+            s, en = _aeg_shift_window(o['shift'], date.fromisoformat(o['date']))
+            out.setdefault(o['user_id'], []).append({'date': o['date'], 'shift_id': o['shift']['id'],
+                                                     'shift': o['shift']['name'], 'start': s, 'end': en})
+    for lst in out.values():
+        lst.sort(key=lambda i: i['start'])
+    return out
+
+
+def _aeg_check(cat: dict, rules: dict, intervals: dict[int, list[dict]], start: date, end: date,
+               absences: list[dict], users: set[int] | None) -> list[dict]:
+    issues = []
+
+    def name(uid):
+        return cat['employees'].get(uid, {}).get('name', str(uid))
+
+    in_range = lambda iso: start.isoformat() <= iso <= end.isoformat()
+    for uid, lst in intervals.items():
+        if users is not None and uid not in users:
+            continue
+        # rest between consecutive shifts
+        for a, b in zip(lst, lst[1:]):
+            gap = (b['start'] - a['end']).total_seconds() / 3600
+            if gap < rules['min_rest_hours'] and (in_range(a['date']) or in_range(b['date'])):
+                kind = 'overlap' if gap < 0 else 'rest'
+                issues.append({'rule': kind, 'employee': name(uid), 'date': b['date'],
+                               'detail': f'{a["shift"]} {a["date"]} ends {a["end"]:%d.%m %H:%M} -> '
+                                         f'{b["shift"]} starts {b["start"]:%d.%m %H:%M}: '
+                                         f'{gap:.1f} h rest (< {rules["min_rest_hours"]} h)'})
+        # consecutive working days / nights
+        work_days = sorted({i['date'] for i in lst})
+        night_days = sorted({i['date'] for i in lst if i['end'].date() > i['start'].date()})
+        for label, days, limit in (('consecutive', work_days, rules.get('max_consecutive_days')),
+                                   ('nights', night_days, rules.get('max_consecutive_nights'))):
+            if not limit:
+                continue
+            run: list[str] = []
+            for d in days + ['']:
+                if run and d and date.fromisoformat(d) - date.fromisoformat(run[-1]) == timedelta(days=1):
+                    run.append(d)
+                    continue
+                if len(run) > limit and any(in_range(x) for x in run):
+                    issues.append({'rule': label, 'employee': name(uid), 'date': run[limit],
+                                   'detail': f'{len(run)} in a row {run[0]}..{run[-1]} (max {limit})'})
+                run = [d] if d else []
+        # weekly hours (ISO weeks touching the range)
+        if rules.get('max_week_hours'):
+            weeks: dict[tuple[int, int], float] = {}
+            for i in lst:
+                iso = i['start'].date().isocalendar()
+                weeks[(iso[0], iso[1])] = weeks.get((iso[0], iso[1]), 0) + (i['end'] - i['start']).total_seconds() / 3600
+            for (y, w), h in sorted(weeks.items()):
+                mon = date.fromisocalendar(y, w, 1)
+                if h > rules['max_week_hours'] and mon <= end and mon + timedelta(days=6) >= start:
+                    issues.append({'rule': 'week_hours', 'employee': name(uid), 'date': mon.isoformat(),
+                                   'detail': f'week {y}-W{w:02d}: {h:g} h (max {rules["max_week_hours"]} h)'})
+        # shift on an absence day
+        for ab in absences:
+            if ab['user_id'] == uid and any(i['date'] == ab['date'] for i in lst) and in_range(ab['date']):
+                issues.append({'rule': 'absence', 'employee': name(uid), 'date': ab['date'],
+                               'detail': f'planned on an absence day ({ab["absence"]})'})
+    # headcount per shift per day: "Shift=N" or "Shift@YYYY-MM-DD=N"
+    days = [start + timedelta(days=i) for i in range((end - start).days + 1)]
+    for req in rules.get('require') or []:
+        m = re.match(r'^(.+?)(?:@(\d{4}-\d{2}-\d{2}))?=(\d+)$', str(req).strip())
+        if not m:
+            _err(f'--require {req!r}: use "SHIFT=N" or "SHIFT@YYYY-MM-DD=N".')
+        sh = _aeg_shift(cat, m.group(1).strip())
+        need = int(m.group(3))
+        try:
+            req_days = [date.fromisoformat(m.group(2))] if m.group(2) else days
+        except ValueError:
+            print(f'Error: --require {req!r}: {m.group(2)} is not a calendar date.', file=sys.stderr)
+            sys.exit(2)
+        for d in req_days:
+            have = sum(1 for lst in intervals.values() for i in lst
+                       if i['shift_id'] == sh['id'] and i['date'] == d.isoformat())
+            if have < need:
+                issues.append({'rule': 'headcount', 'employee': '', 'date': d.isoformat(),
+                               'detail': f'{sh["name"]}: {have} of {need} planned'})
+    # at least one senior per shift per day: "Shift=Name A,Name B"
+    for spec in rules.get('senior') or []:
+        if '=' not in str(spec):
+            _err(f'--senior {spec!r}: use "SHIFT=Name A,Name B".')
+        shift_ref, people = str(spec).split('=', 1)
+        sh = _aeg_shift(cat, shift_ref.strip())
+        seniors = {_aeg_employee(cat, p.strip())['user_id'] for p in people.split(',') if p.strip()}
+        for d in days:
+            staffed = {uid for uid, lst in intervals.items() for i in lst
+                       if i['shift_id'] == sh['id'] and i['date'] == d.isoformat()}
+            if staffed and not staffed & seniors:
+                issues.append({'rule': 'senior', 'employee': '', 'date': d.isoformat(),
+                               'detail': f'{sh["name"]}: no senior ({", ".join(name(u) for u in seniors)})'})
+    return sorted(issues, key=lambda i: (i['date'], i['rule'], i['employee']))
+
+
+def _aeg_print_issues(issues: list[dict]) -> None:
+    if not issues:
+        print('\n  CHECK: OK - no rule violations.')
+        return
+    print(f'\n  CHECK: {len(issues)} violation(s)\n')
+    rows = [[i['rule'], i['date'], i['employee'], i['detail']] for i in issues]
+    widths = [max([len(h)] + [len(str(r[c])) for r in rows]) for c, h in enumerate(['Rule', 'Date', 'Employee', 'Detail'])]
+    _table(['Rule', 'Date', 'Employee', 'Detail'], rows, widths)
+
+
+def _aeg_run_check(cat, rules, start, end, ops=None, users=None):
+    """Load existing shifts with a 7-day margin (rest / consecutive-day context),
+    overlay `ops`, and return the issues inside [start, end]."""
+    lo, hi = start - timedelta(days=7), end + timedelta(days=1)
+    for y, m in _aeg_months(lo, hi):
+        _aeg_grid(y, m)
+    cat = _aeg_catalog(lo, hi) if cat is None else cat
+    existing = _aeg_entries(lo, hi)
+    absences = [e for e in existing if e.get('absence')]
+    if ops:
+        by_key = {(e['user_id'], e['date'], e.get('id')): e for e in existing}
+        for o in ops:
+            if o.get('row'):
+                o['row'] = by_key.get((o['row']['user_id'], o['row']['date'], o['row'].get('id')), o['row'])
+    return _aeg_check(cat, rules, _aeg_intervals(cat, existing, ops), start, end, absences, users)
+
+
+def cmd_aeg_schedule_check(args):
+    start, end = _aeg_range(args)
+    cat = _aeg_catalog(start - timedelta(days=7), end + timedelta(days=1))
+    plan = _aeg_load_plan(args.plan) if getattr(args, 'plan', None) else None
+    rules = _aeg_rules(args, plan)
+    users = _aeg_selected_users(cat, args)
+    ops = None
+    if plan:
+        clears: dict = {}
+        targets = _aeg_build_targets(cat, plan, clears)
+        users = (users or set()) | {k[0] for k in targets}
+        ops = _aeg_diff(cat, targets, _aeg_entries(start, end), clears=clears)
+    issues = _aeg_run_check(cat, rules, start, end, ops, users)
+    if args.json:
+        _json_out({'range': [start.isoformat(), end.isoformat()], 'rules': rules, 'issues': issues})
+    else:
+        print(f'\n  RULES: rest >= {rules["min_rest_hours"]} h, <= {rules["max_consecutive_days"]} days in a row'
+              f'{", <= " + str(rules["max_consecutive_nights"]) + " nights in a row" if rules.get("max_consecutive_nights") else ""}'
+              f', <= {rules["max_week_hours"]} h/week'
+              f'{", require " + "; ".join(rules["require"]) if rules["require"] else ""}'
+              f'{", senior " + "; ".join(rules["senior"]) if rules["senior"] else ""}'
+              '  (client-side checks; the server does not validate these)')
+        _aeg_print_issues(issues)
+        print()
+    if issues:
+        sys.exit(3)
+
+
+# --- write commands -----------------------------------------------------------
+
+def _aeg_ops_json(ops: list[dict]) -> list[dict]:
+    return [{'op': o['op'], 'date': o['date'], 'employee': o['employee'], 'user_id': o['user_id'],
+             'was': (o.get('row') or {}).get('shift'), 'becomes': (o.get('shift') or {}).get('name'),
+             'location_id': o.get('location_id')} for o in ops]
+
+
+def _aeg_apply_ops(cat, ops, args, rules, start, end, users) -> None:
+    """Shared tail of set/apply/delete: diff -> check -> (dry-run | confirm) -> write -> verify.
+
+    --json prints ONE JSON document on stdout; the human tables/notes of a real
+    write go to stderr so an agent parsing stdout never sees them."""
+    legacy = bool(getattr(args, 'legacy_save', False))
+    if args.json and args.dry_run:
+        issues = _aeg_run_check(cat, rules, start, end, ops, users) if rules else []
+        _json_out({'ops': _aeg_ops_json(ops), 'issues': issues, 'legacy_save': legacy,
+                   'legacy_save_note': _AEG_LEGACY_NOTE if legacy else None})
+        if issues:
+            sys.exit(3)
+        return
+    if args.json:
+        with contextlib.redirect_stdout(sys.stderr):
+            result = _aeg_apply_ops_run(cat, ops, args, rules, start, end, users, legacy)
+        _json_out(dict({'ops': _aeg_ops_json(ops), 'legacy_save': legacy},
+                       **{k: v for k, v in result.items() if k != 'exit'}))
+    else:
+        result = _aeg_apply_ops_run(cat, ops, args, rules, start, end, users, legacy)
+    if result['exit']:
+        sys.exit(result['exit'])
+
+
+def _aeg_apply_ops_run(cat, ops, args, rules, start, end, users, legacy: bool) -> dict:
+    """The human-readable body of _aeg_apply_ops. Prints to stdout; returns the
+    outcome with the exit code instead of exiting (so --json can still report it)."""
+    out = {'issues': [], 'written': None, 'verified': None, 'expected': None, 'exit': 0}
+    print()
+    _aeg_print_diff(cat, ops)
+    issues = []
+    if rules:
+        issues = _aeg_run_check(cat, rules, start, end, ops, users)
+        _aeg_print_issues(issues)
+    out['issues'] = issues
+    if legacy:
+        print(f'\n  {_AEG_LEGACY_NOTE}')
+    if args.dry_run:
+        print('\n  DRY RUN - nothing written.\n')
+        out['exit'] = 3 if issues else 0
+        return out
+    if issues and not getattr(args, 'force', False):
+        # Same exit code as a dry run / `check` with violations (3), not a generic error (1).
+        print(f'Error: {len(issues)} rule violation(s) - fix the plan, or pass --force to write anyway.',
+              file=sys.stderr)
+        out['exit'] = 3
+        return out
+    if not any(o['op'] != 'keep' for o in ops):
+        print('\n  Nothing to write.\n')
+        return out
+    n_del = sum(1 for o in ops if o['op'] in ('delete', 'update'))
+    if n_del or legacy:
+        # --legacy-save may notify employees and write other rows than the diff:
+        # always confirmed, even for a create-only plan.
+        what = f'delete/replace {n_del} existing planned shift(s)' if n_del else 'write the planned shifts'
+        legacy_txt = (' WITH --legacy-save (on a 403: Graafik save - one location-less shift per day, '
+                      'located rows kept, employees notified)') if legacy else ''
+        _confirm_destructive(f'{what} on {_get_url()}{legacy_txt}', getattr(args, 'yes', False))
+    total = _aeg_write(cat, ops, legacy_save=legacy)
+    _aeg_report_write(total)
+    out['written'] = total
+    # Read back: every created/updated target must now be on the server.
+    _AEG_GRID_CACHE.clear()
+    after = _aeg_entries(start, end)
+    want = [(o['user_id'], o['date'], o['shift']['id']) for o in ops if o['op'] in ('create', 'update', 'keep')]
+    present = {(e['user_id'], e['date'], e.get('shift_id')) for e in after}
+    gone = [(o['user_id'], o['date'], o['row'].get('id')) for o in ops if o['op'] == 'delete']
+    still = {(e['user_id'], e['date'], e.get('id')) for e in after}
+    ok = sum(1 for w in want if w in present) + sum(1 for g in gone if g not in still)
+    print(f'  Verified on server: {ok}/{len(want) + len(gone)} cells match the plan.\n')
+    out.update(verified=ok, expected=len(want) + len(gone))
+    if ok != len(want) + len(gone):
+        out['exit'] = 4
+    return out
+
+
+def cmd_aeg_schedule_set(args):
+    if not args.date and not args.date_from:
+        _err('Pass --date (repeatable) or --from/--to.')
+    if args.date_from and not args.date_to:
+        args.date_to = args.date_from
+    start, end = _aeg_range(args)
+    cat = _aeg_catalog(start, end)
+    emp_refs = args.employee or []
+    if not emp_refs:
+        _err('--employee is required.')
+    if args.date:
+        dates = sorted({_aeg_parse_date(d) for d in args.date})
+    else:
+        dates = [start + timedelta(days=i) for i in range((end - start).days + 1)]
+        if args.weekdays:
+            keep = args.weekdays  # a frozenset, validated by _aeg_weekdays_arg
+            if isinstance(keep, str):
+                keep = _aeg_weekdays_arg(keep)
+            dates = [d for d in dates if d.isoweekday() in keep]
+    plan = {'location': args.location, 'assignments': [
+        {'employee': ref, 'date': d.isoformat(), 'shift': args.shift} for ref in emp_refs for d in dates]}
+    targets = _aeg_build_targets(cat, plan)
+    ops = _aeg_diff(cat, targets, _aeg_entries(start, end))
+    rules = _aeg_rules(args) if not args.no_check else None
+    _aeg_apply_ops(cat, ops, args, rules, start, end, {k[0] for k in targets})
+
+
+def cmd_aeg_schedule_apply(args):
+    plan = _aeg_load_plan(args.file)
+    dates = [_aeg_parse_date(str(a.get('date'))) for a in plan['assignments'] if isinstance(a, dict) and a.get('date')]
+    if not dates:
+        _err('Plan has no dated assignments.')
+    start, end = min(dates), max(dates)
+    cat = _aeg_catalog(start, end)
+    clears: dict = {}
+    targets = _aeg_build_targets(cat, plan, clears)
+    users = {k[0] for k in targets}
+    plan_locs = {t['location_id'] for cell in targets.values() for t in cell if t['location_id']}
+    if plan.get('location'):
+        plan_locs.add(_aeg_location_id(cat, plan['location']))
+    ops = _aeg_diff(cat, targets, _aeg_entries(start, end),
+                    prune_users=users if args.prune else None, prune_range=(start, end),
+                    prune_locations=plan_locs, clears=clears)
+    rules = _aeg_rules(args, plan) if not args.no_check else None
+    # --json: stdout carries ONE JSON document; the human header goes to stderr.
+    print(f'\n  PLAN {args.file}: {len(plan["assignments"])} assignment(s), {len(users)} employee(s), '
+          f'{start.isoformat()} .. {end.isoformat()}', file=sys.stderr if args.json else sys.stdout)
+    _aeg_apply_ops(cat, ops, args, rules, start, end, users)
+
+
+def cmd_aeg_schedule_delete(args):
+    if not (args.date or args.date_from or args.month or args.week):
+        _err('Pass --date, --from/--to, --month or --week.')
+    if not (args.employee or args.department or args.location or args.role or args.shift or args.all_in_scope):
+        _err('Pass a selector (--employee/--department/--location/--role/--shift), '
+             'or --all-in-scope to delete every planned shift in the range.')
+    if args.date_from and not args.date_to:
+        args.date_to = args.date_from
+    start, end = _aeg_range(args)
+    only = _aeg_explicit_dates(args)  # --date d1 --date d2 deletes on those days, never d1..d2
+    cat = _aeg_catalog(start, end)
+    # Selectors narrow the ROWS, not just the people:
+    #  * --location: rows planned AT that one location (resolved exactly / unique).
+    #  * --department: its people's rows at the department's location(s)
+    #    (_aeg_department_locations); a location-less row (Graafik grid-save
+    #    fallback writes those) of one of its people stays deletable - it has no
+    #    location to compare.
+    #  * a location-less row under --location counts as its employee's home location.
+    loc = args.location
+    loc_ids = {_aeg_location_id(cat, loc)} if loc else None
+    dept_locs = _aeg_department_locations(cat, args.department) if args.department else None
+    args.location = None
+    users = _aeg_selected_users(cat, args)
+    sh = _aeg_shift(cat, args.shift, loc) if args.shift else None
+
+    def _in_scope(e):
+        if loc_ids is not None and not _aeg_row_at(cat, e, loc_ids):
+            return False
+        return dept_locs is None or not e.get('location_id') or e['location_id'] in dept_locs
+
+    rows = [e for e in _aeg_entries(start, end) if e.get('shift_id')
+            and (only is None or e['date'] in only)
+            and (users is None or e['user_id'] in users) and (sh is None or e['shift_id'] == sh['id'])
+            and _in_scope(e)]
+    ops = [{'op': 'delete', 'user_id': r['user_id'], 'employee': r['employee'], 'date': r['date'],
+            'row': r, 'shift': None, 'location_id': r.get('location_id')} for r in rows]
+    if not ops:
+        print('\n  No planned shifts match - nothing to delete.\n')
+        return
+    _aeg_apply_ops(cat, ops, args, None, start, end, users)
+
+
+def cmd_aeg(args):
+    global _AEG_ARGS
+    _AEG_ARGS = args
+    handler = {
+        'employees': cmd_aeg_employees,
+        'shifts': cmd_aeg_shifts,
+        'locations': cmd_aeg_locations,
+        'departments': cmd_aeg_departments,
+    }.get(args.aeg_command)
+    if handler:
+        return handler(args)
+    if args.aeg_command == 'schedule':
+        return {
+            'get': cmd_aeg_schedule_get,
+            'set': cmd_aeg_schedule_set,
+            'apply': cmd_aeg_schedule_apply,
+            'delete': cmd_aeg_schedule_delete,
+            'check': cmd_aeg_schedule_check,
+        }[args.schedule_command](args)
+    _err('Usage: tark_cli aeg {employees|shifts|locations|departments|schedule} ...')
+
+
+def _aeg_week_arg(raw: str) -> str:
+    """argparse type for --week: a real ISO week (2026-W54 is refused cleanly)."""
+    m = re.match(r'^(\d{4})-W?(\d{1,2})$', (raw or '').strip())
+    if m:
+        try:
+            date.fromisocalendar(int(m.group(1)), int(m.group(2)), 1)
+            return raw.strip()
+        except ValueError:
+            pass
+    raise argparse.ArgumentTypeError(f'{raw!r} is not an ISO week - use YYYY-Www (e.g. 2026-W41)')
+
+
+def _aeg_month_arg(raw: str) -> str:
+    """argparse type for --month: YYYY-MM with a month 1..12."""
+    m = re.match(r'^(\d{4})-(\d{1,2})$', (raw or '').strip())
+    if m and 1 <= int(m.group(2)) <= 12 and int(m.group(1)) >= 1:
+        return raw.strip()
+    raise argparse.ArgumentTypeError(f'{raw!r} is not a month - use YYYY-MM (e.g. 2026-10)')
+
+
+def _aeg_require_arg(raw: str) -> str:
+    """argparse type for --require: "SHIFT=N" or "SHIFT@YYYY-MM-DD=N" with a real calendar date."""
+    m = re.match(r'^(.+?)(?:@(\d{4}-\d{2}-\d{2}))?=(\d+)$', (raw or '').strip())
+    if not m:
+        raise argparse.ArgumentTypeError(f'{raw!r}: use "SHIFT=N" or "SHIFT@YYYY-MM-DD=N"')
+    if m.group(2):
+        try:
+            date.fromisoformat(m.group(2))
+        except ValueError:
+            raise argparse.ArgumentTypeError(f'{raw!r}: {m.group(2)} is not a calendar date') from None
+    return raw
+
+
+def _aeg_weekdays_arg(raw: str) -> frozenset:
+    """argparse type for --weekdays: comma-separated ISO weekdays 1 (Mon) .. 7 (Sun)."""
+    try:
+        days = frozenset(int(x) for x in (raw or '').split(',') if x.strip())
+    except ValueError:
+        days = frozenset()
+    if not days or not days <= set(range(1, 8)):
+        raise argparse.ArgumentTypeError(f'{raw!r}: use ISO weekdays 1-7, comma-separated (e.g. 1,2,3,4,5)')
+    return days
+
+
+def _add_aeg_parser(sub) -> None:
+    aeg = sub.add_parser('aeg', help='Tark Aeg (workforce) - employees, shifts, schedules '
+                                     '(seat login; workforce:* PAT scopes not yet available on servers)')
+    aeg.add_argument('--auth', choices=('auto', 'pat', 'login'),
+                     help='auto (default): PAT schedule API if the server has it, else seat login; '
+                          'login: always log in as --user (password from --password-env, the profile '
+                          '`password_env`, $TARK_AEG_PASSWORD on the default host only, else a prompt)')
+    aeg.add_argument('--user', help='Seat username for seat login (default: profile `user` / $TARK_AEG_USER)')
+    aeg.add_argument('--relogin', action='store_true',
+                     help='Seat login: forget the cached JWT and log in again (e.g. after a capability change)')
+    asub = aeg.add_subparsers(dest='aeg_command')
+
+    def _filters(p, employee=True):
+        p.add_argument('--department', '-d', help='Location or role-group name (substring)')
+        p.add_argument('--location', '-l', help='Location name (substring)')
+        p.add_argument('--role', help='Role / group name (substring)')
+        if employee:
+            p.add_argument('--employee', '-e', action='append',
+                           help='Employee id, username or name (repeatable)')
+
+    def _range(p):
+        p.add_argument('--date', action='append', help='Day YYYY-MM-DD (repeatable)')
+        p.add_argument('--from', dest='date_from', help='Range start YYYY-MM-DD')
+        p.add_argument('--to', dest='date_to', help='Range end YYYY-MM-DD (inclusive)')
+        p.add_argument('--month', type=_aeg_month_arg, help='Whole month YYYY-MM')
+        p.add_argument('--week', type=_aeg_week_arg, help='ISO week YYYY-Www')
+
+    def _rules(p):
+        p.add_argument('--min-rest', dest='min_rest', type=float, help='Min rest between shifts, hours (default 11)')
+        p.add_argument('--max-consecutive', dest='max_consecutive', type=int,
+                       help='Max working days in a row (default 5)')
+        p.add_argument('--max-nights', dest='max_nights', type=int, help='Max night shifts in a row (default off)')
+        p.add_argument('--max-week-hours', dest='max_week_hours', type=float, help='Max hours per ISO week (default 48)')
+        p.add_argument('--require', action='append', type=_aeg_require_arg, help='Headcount "SHIFT=N" or "SHIFT@YYYY-MM-DD=N" (repeatable)')
+        p.add_argument('--senior', action='append', help='"SHIFT=Name A,Name B": one of them on every such shift')
+
+    def _write(p):
+        p.add_argument('--dry-run', dest='dry_run', action='store_true', help='Print the diff + checks, write nothing')
+        p.add_argument('--yes', '-y', action='store_true', help='Confirm deleting/replacing existing shifts')
+        p.add_argument('--force', action='store_true', help='Write even when rule checks fail')
+        p.add_argument('--legacy-save', dest='legacy_save', action='store_true',
+                       help='If the Plan/Actual save is refused (403), use the Graafik save instead: one '
+                            'location-less shift per day, located rows NOT deleted, one "schedule.published" '
+                            'per month notifies the employees. Without it a 403 aborts the write.')
+
+    p = asub.add_parser('employees', help='Employees in your schedule scope')
+    _filters(p, employee=False)
+    p.add_argument('--search', '-s', help='Name/username substring')
+    p.add_argument('--month', type=_aeg_month_arg, help='Month YYYY-MM (default: this month)')
+    p = asub.add_parser('shifts', help='Shift catalogue (per location)')
+    p.add_argument('--location', '-l', help='Location name (substring)')
+    p.add_argument('--department', '-d', help='Alias of --location')
+    p.add_argument('--month', type=_aeg_month_arg, help='Month YYYY-MM (default: this month)')
+    p = asub.add_parser('locations', help='Locations (departments) with headcount')
+    p.add_argument('--month', type=_aeg_month_arg, help='Month YYYY-MM (default: this month)')
+    p = asub.add_parser('departments', help='Role groups per location with headcount')
+    p.add_argument('--month', type=_aeg_month_arg, help='Month YYYY-MM (default: this month)')
+
+    sched = asub.add_parser('schedule', help='Read / write / delete / check planned shifts')
+    ssub = sched.add_subparsers(dest='schedule_command', required=True)
+    p = ssub.add_parser('get', help='Planned shifts in a range (grid <= 14 days, else list)')
+    _range(p)
+    _filters(p)
+    p.add_argument('--shift', help='Only this shift (id, code or name)')
+    p.add_argument('--format', choices=['grid', 'list'], help='Output layout')
+    p = ssub.add_parser('set', help="Set one shift for employee(s) on date(s) (replaces that day's "
+                                    'shift at the same location; shifts elsewhere are kept)')
+    _range(p)
+    p.add_argument('--employee', '-e', action='append', help='Employee id, username or name (repeatable)')
+    p.add_argument('--shift', required=True, help='Shift id, code or name')
+    p.add_argument('--location', '-l', help='Location for the shift (default: inferred)')
+    p.add_argument('--weekdays', type=_aeg_weekdays_arg,
+                   help='With --from/--to: ISO weekdays to keep, e.g. 1,2,3,4,5')
+    p.add_argument('--no-check', dest='no_check', action='store_true', help='Skip rule checks')
+    _rules(p)
+    _write(p)
+    p = ssub.add_parser('apply', help='Apply a plan file (JSON or CSV): diff, check, write')
+    p.add_argument('file', help='Plan file (.json or .csv)')
+    p.add_argument('--prune', action='store_true',
+                   help="Also delete the plan employees' other shifts inside the plan's date range "
+                        "at the plan's location(s) - shifts elsewhere are kept")
+    p.add_argument('--no-check', dest='no_check', action='store_true', help='Skip rule checks')
+    _rules(p)
+    _write(p)
+    p = ssub.add_parser('delete', help='Delete planned shifts (single day, range, employee, department)',
+                        description='Repeated --date deletes on exactly those days. -l/-d delete only '
+                                    'rows at that location / the department\'s locations.')
+    _range(p)
+    _filters(p)
+    p.add_argument('--shift', help='Only this shift (id, code or name)')
+    p.add_argument('--all-in-scope', dest='all_in_scope', action='store_true',
+                   help='No selector: delete EVERY planned shift in the range you can manage')
+    _write(p)
+    p = ssub.add_parser('check', help='Check rest / consecutive days / weekly hours / headcount rules')
+    _range(p)
+    _filters(p)
+    p.add_argument('--plan', help='Check the schedule as it WOULD be after applying this plan file')
+    _rules(p)
+
+
+# ---------------------------------------------------------------------------
 # Commands: Config
 # ---------------------------------------------------------------------------
 
+def _mask_secret(key: str, val) -> str:
+    if key == 'pat' and len(str(val)) > 12:
+        return f'{str(val)[:8]}...'
+    return str(val)
+
+
 def cmd_config(args):
-    """Show or set config."""
+    """Show or set config. With --profile NAME, `set` writes into profiles.NAME."""
     if args.action == 'set' and args.key and args.value:
+        if 'password' in args.key.lower() and args.key != 'password_env':
+            _err(f'Refusing to store {args.key!r} in {CONFIG_FILE}: passwords are never written to config. '
+                 'Put it in an env var (e.g. in a private chmod-600 env file you source) and name that var with '
+                 '`config set password_env VAR_NAME`, or use $TARK_AEG_PASSWORD / $TARK_PASSWORD.')
         cfg = _load_config()
         # Convert user_id to int
         val = args.value
         if args.key == 'user_id':
             val = int(val)
+        if _PROFILE:
+            cfg.setdefault('profiles', {}).setdefault(_PROFILE, {})[args.key] = val
+            _save_config(cfg)
+            print(f'  Saved profiles.{_PROFILE}.{args.key} to {CONFIG_FILE}')
+            return
         cfg[args.key] = val
         _save_config(cfg)
         print(f'  Saved {args.key} to {CONFIG_FILE}')
@@ -3029,7 +4640,14 @@ def cmd_config(args):
 
     cfg = _load_config()
     if args.json:
-        _json_out(cfg)
+        masked = {k: v for k, v in cfg.items() if k not in ('pat', 'profiles')}
+        if 'pat' in cfg:
+            masked['pat'] = _mask_secret('pat', cfg['pat'])
+        masked['profiles'] = {
+            name: {k: _mask_secret(k, v) for k, v in (prof or {}).items()}
+            for name, prof in (cfg.get('profiles') or {}).items()
+        }
+        _json_out(masked)
         return
 
     print(f'\n  CONFIG ({CONFIG_FILE})\n')
@@ -3040,17 +4658,35 @@ def cmd_config(args):
         print('    tark_cli config set pat tark_pat_...')
         print('    tark_cli config set url https://your-deployment.example.com')
         print('    tark_cli config set user_id 38')
+        print('  Second server/tenant (named profile):')
+        print('    tark_cli --profile demo config set url https://demo.example.com')
+        print('    tark_cli --profile demo config set pat_env TARK_DEMO_PAT')
     else:
         for k, v in cfg.items():
-            display = f'{str(v)[:8]}...' if k == 'pat' and len(str(v)) > 12 else v
-            print(f'  {k}: {display}')
+            if k == 'profiles':
+                continue
+            print(f'  {k}: {_mask_secret(k, v)}')
+        for name, prof in (cfg.get('profiles') or {}).items():
+            print(f'  profile {name}:')
+            for k, v in (prof or {}).items():
+                print(f'    {k}: {_mask_secret(k, v)}')
 
     # Show effective values
     print()
-    print('  Effective:')
-    url = os.environ.get('TARK_URL') or os.environ.get('C2_URL', '') or cfg.get('url', '')
+    print(f'  Effective{f" (profile {_PROFILE})" if _PROFILE else ""}:')
+    if _PROFILE or _URL_OVERRIDE:
+        url = _get_url()
+    else:
+        url = os.environ.get('TARK_URL') or os.environ.get('C2_URL', '') or cfg.get('url', '')
     print(f'    URL:     {url or "(not set)"}')
-    pat = os.environ.get('TARK_PAT') or os.environ.get('C2_PAT', '') or cfg.get('pat', '')
+    if _URL_OVERRIDE:
+        pat = _PAT_OVERRIDE
+    elif _PROFILE:
+        prof = _profile_cfg() or {}
+        env_name = prof.get('pat_env', '')
+        pat = _PAT_OVERRIDE or (os.environ.get(env_name, '') if env_name else '') or prof.get('pat', '')
+    else:
+        pat = _PAT_OVERRIDE or os.environ.get('TARK_PAT') or os.environ.get('C2_PAT', '') or cfg.get('pat', '')
     print(f'    PAT:     {"***" + pat[-6:] if pat else "(not set)"}')
     print(f'    User ID: {_get_user_id() or "(not set)"}')
     print()
@@ -3081,6 +4717,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--pat-env', dest='pat_env',
         help='Env var name to read PAT from (overrides the default TARK_PAT/C2_PAT lookup)',
+    )
+    parser.add_argument(
+        '--profile',
+        help='Named server/tenant profile from config.json "profiles" (or $TARK_PROFILE). '
+             'Its url + PAT never fall back to the default ones.',
+    )
+    parser.add_argument('--url', help='Explicit deployment URL (overrides profile, env and config). '
+                        'Only an explicit --pat/--pat-env is sent to it - never a stored PAT')
+    parser.add_argument(
+        '--password-env', dest='password_env',
+        help='Env var holding the login password for this run (tokens / aeg seat login). Wins over '
+             'the profile/default lookup, and is the only env password sent to a --url host that is '
+             'not the target\'s own host',
+    )
+    parser.add_argument(
+        '--resolve-ip', dest='resolve_ip',
+        help='Connect to this IP for the URL\'s host (DNS not propagated yet; TLS still checks the '
+             'host name). Profile key `resolve_ip` does the same for that profile only.',
     )
     sub = parser.add_subparsers(dest='command')
 
@@ -3412,10 +5066,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--user', help='Web-login username (else config `user`, else prompt)')
     p.add_argument('--yes', '-y', action='store_true', help='revoke: skip the confirmation prompt')
 
+    # aeg - workforce schedules (workforce:read / workforce:write)
+    _add_aeg_parser(sub)
+
     # config [set <key> <value>]
     p = sub.add_parser('config', help='Show/set config')
     p.add_argument('action', nargs='?', default='show', help='"set" to save a value')
-    p.add_argument('key', nargs='?', help='Config key (pat, url, user_id)')
+    p.add_argument('key', nargs='?', help='Config key (pat, pat_env, url, user, user_id); with --profile NAME it lands in profiles.NAME')
     p.add_argument('value', nargs='?', help='Config value')
 
     return parser
@@ -3483,18 +5140,51 @@ COMMANDS = {
     'update': cmd_update,
     'api': cmd_api,
     'tokens': cmd_tokens,
+    'aeg': cmd_aeg,
     'config': cmd_config,
     # Detail (retrieve) commands - one per PAT resource that allows `retrieve`.
     **{_n: _make_detail_cmd(_p, _l) for _n, (_p, _l) in _DETAIL_RESOURCES.items()},
 }
 
 
+def _pin_host_ip(ip: str) -> None:
+    """Resolve ONLY the configured URL's host to `ip` (like curl --resolve): the TLS
+    handshake still sends and verifies the real host name; other hosts resolve normally."""
+    import socket
+    host = urllib.parse.urlsplit(_get_url()).hostname
+    real_getaddrinfo = socket.getaddrinfo
+
+    def getaddrinfo(h, *a, **kw):
+        return real_getaddrinfo(ip if h == host else h, *a, **kw)
+    socket.getaddrinfo = getaddrinfo
+
+
+def _effective_resolve_ip(args) -> str:
+    """--resolve-ip wins; else the profile's `resolve_ip`, but only while the run
+    targets the profile's own host - never pinned onto a different --url host."""
+    if args.resolve_ip:
+        return args.resolve_ip
+    if not _PROFILE or args.command == 'config':
+        return ''
+    prof = (_load_config().get('profiles') or {}).get(_PROFILE) or {}
+    ip = prof.get('resolve_ip', '')
+    if ip and _URL_OVERRIDE and not _same_host(_URL_OVERRIDE, prof.get('url', '')):
+        _warn(f'profile {_PROFILE!r} resolve_ip not applied: --url host is not the profile host.')
+        return ''
+    return ip
+
+
 def main():
-    global _PAT_OVERRIDE
+    global _PAT_OVERRIDE, _URL_OVERRIDE, _PROFILE, _PASSWORD_ENV_OVERRIDE
     parser = build_parser()
     args = parser.parse_args()
 
+    _PROFILE = args.profile or os.environ.get('TARK_PROFILE', '')
+    if args.url:
+        _URL_OVERRIDE = args.url
+
     # Resolve PAT override: --pat > --pat-env > TARK_PAT/C2_PAT env > config.json
+    # (under --url only --pat/--pat-env - see _get_pat)
     if args.pat:
         _PAT_OVERRIDE = args.pat
     elif args.pat_env:
@@ -3502,6 +5192,15 @@ def main():
         if not val:
             _err(f'--pat-env {args.pat_env!r} is set but the env var is empty or unset')
         _PAT_OVERRIDE = val
+
+    if args.password_env:
+        if not os.environ.get(args.password_env):
+            _err(f'--password-env {args.password_env!r} is set but the env var is empty or unset')
+        _PASSWORD_ENV_OVERRIDE = args.password_env
+
+    resolve_ip = _effective_resolve_ip(args)
+    if resolve_ip:
+        _pin_host_ip(resolve_ip)
 
     if not args.command:
         parser.print_help()
