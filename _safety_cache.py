@@ -4,10 +4,13 @@ Stores only SAFE verdicts — UNSAFE / unparseable / errors always re-screen.
 Bounded LRU + TTL. flock-guarded on POSIX, lock-free on Windows (acceptable:
 cache is single-user and races produce stale-but-not-corrupt JSON).
 
-Cache key includes SAFETY_CHECK_MODEL. The default `agy` binary auto-selects
-its model (no -m flag), so SAFETY_CHECK_MODEL no longer selects a model — it
-now serves as a manual cache-bust knob (bump it to invalidate all cached
-verdicts) and still pins the model for GEMINI_BIN=gemini enterprise installs.
+Cache key = SHA-256(SAFETY_CHECK_MODEL + mode + title + body). SAFETY_CHECK_MODEL
+selects a model only for the opt-in GEMINI_BIN=gemini enterprise CLI. The default
+chain ignores it: codex is pinned (SAFETY_CHECK_CODEX_MODEL), claude runs haiku,
+and agy is opt-in via GEMINI_BIN and pinned with --model (SAFETY_CHECK_AGY_MODEL).
+For them it is a manual cache-bust knob: bump it to invalidate every cached
+verdict. The key does not name the provider or its pinned model, so changing a
+pin does not invalidate cached SAFE verdicts by itself.
 
 Disable with TARK_SAFETY_CACHE=0.
 """
