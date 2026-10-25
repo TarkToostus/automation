@@ -38,7 +38,27 @@ if str(_AUTOMATION_DIR) not in sys.path:
 
 import tark_cli  # noqa: E402
 
-LOC = {'id': 7, 'name': 'Vastuvõtt'}
+
+def setUpModule():
+    """Hermetic config: the write / seat-login paths call the real _get_url()
+    (confirm prompt names the host, JWT cache key), so without this every such
+    test read the developer's ~/.config/tark + $TARK_* and failed on a clean CI
+    runner. A throwaway config dir with a default URL, and no TARK_* / C2_* env;
+    classes that need their own config / env still patch on top of this."""
+    tmp = Path(tempfile.mkdtemp())
+    unittest.addModuleCleanup(shutil.rmtree, tmp, ignore_errors=True)
+    (tmp / 'config.json').write_text(json.dumps({'url': 'https://c2.example'}))
+    env = mock.patch.dict('os.environ')
+    for p in (env, mock.patch.object(tark_cli, 'CONFIG_DIR', tmp),
+              mock.patch.object(tark_cli, 'CONFIG_FILE', tmp / 'config.json'),
+              mock.patch.object(tark_cli, 'AEG_SESSIONS_FILE', tmp / 'aeg-sessions.json')):
+        p.start()
+        unittest.addModuleCleanup(p.stop)
+    for k in [k for k in os.environ if k.startswith(('TARK_', 'C2_'))]:
+        del os.environ[k]
+
+
+LOC ={'id': 7, 'name': 'Vastuvõtt'}
 SPA = {'id': 9, 'name': 'Spa'}
 LOC_NAMES = {7: 'Vastuvõtt', 9: 'Spa'}
 SHIFTS = [
