@@ -14,6 +14,7 @@ import unittest
 from argparse import Namespace
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 _AUTOMATION_DIR = Path(__file__).resolve().parent.parent
 if str(_AUTOMATION_DIR) not in sys.path:
@@ -183,16 +184,16 @@ class DepsNotYetDeployedTests(unittest.TestCase):
         def raise_404(req, timeout=15):
             raise urllib.error.HTTPError(req.full_url, 404, 'Not Found', {}, io.BytesIO(b'{"detail": "Not found."}'))
 
-        orig_urlopen = tark_cli.urllib.request.urlopen
-        tark_cli.urllib.request.urlopen = raise_404
         out, err = io.StringIO(), io.StringIO()
-        try:
-            from contextlib import redirect_stderr
-            with redirect_stdout(out), redirect_stderr(err):
-                with self.assertRaises(SystemExit) as ctx:
-                    tark_cli.cmd_deps(ns)
-        finally:
-            tark_cli.urllib.request.urlopen = orig_urlopen
+        from contextlib import redirect_stderr
+        # URL + PAT are stubbed so the test never reads the developer's
+        # ~/.config/tark or $TARK_URL (CI has neither) - _request itself is real.
+        with mock.patch.object(tark_cli.urllib.request, 'urlopen', raise_404), \
+                mock.patch.object(tark_cli, '_get_url', lambda: 'https://c2.example'), \
+                mock.patch.object(tark_cli, '_get_pat', lambda: 't'), \
+                redirect_stdout(out), redirect_stderr(err):
+            with self.assertRaises(SystemExit) as ctx:
+                tark_cli.cmd_deps(ns)
         return ctx.exception.code, out.getvalue(), err.getvalue()
 
     def test_list_404s_cleanly(self):
