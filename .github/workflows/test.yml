@@ -16,6 +16,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      # stdlib only: no install step, no secrets, no network (tests mock every
-      # provider child and HTTP call).
+      # No secrets, no network (tests mock every provider child and HTTP call).
+      # The suite is stdlib unittest; test_sales_followup.py alone is written for
+      # pytest (fixtures, parametrize), so pytest is installed and runs it too.
+      - run: python -m pip install pytest==8.3.5
       - run: python -m unittest discover -s tests -t . -v
+      - run: python -m pytest tests/test_sales_followup.py -v
