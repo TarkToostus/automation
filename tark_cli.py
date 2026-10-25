@@ -753,7 +753,9 @@ def _safety_subprocess_env() -> dict[str, str]:
     # Pass through XDG_* + locale so CLI configs / locales resolve correctly.
     for k in ('XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_DATA_HOME',
               'XDG_RUNTIME_DIR', 'LANG', 'LC_ALL', 'LC_CTYPE',
-              'NVM_DIR', 'NODE_PATH'):
+              'NVM_DIR', 'NODE_PATH',
+              # Account selection (which login dir codex/claude use), not credentials.
+              'CODEX_HOME', 'CLAUDE_CONFIG_DIR'):
         if k in os.environ:
             env[k] = os.environ[k]
     # API-key opt-in - explicit and global.
