@@ -128,6 +128,18 @@ API with a Personal Access Token.
 - **[Command reference](docs/COMMANDS.md)** — every command, auth, output formats, endpoints
 - **[Examples](examples/)** — short scripts: dashboard, time logging, bulk import, weekly report
 
+**Reading big task wikis.** `tark_cli wiki 123 get --headings` prints each `## ` heading with
+its line count; `tark_cli wiki 123 get --section "DoD"` prints just that section's body (exact
+title; a missing one exits 1 and names the near-misses, safety-screened like the wiki). Read
+the map, then one section.
+
+**Safety screen.** In an agent session every wiki/task/comment read is screened by an LLM
+before it prints — the WHOLE text, in ≤8,000-char chunks that overlap by 1,000 chars, fail-closed
+if any chunk is unsafe or unjudged. Chain: Claude haiku → Gemini (`GEMINI_BIN`, opt-in) → Codex.
+SAFE verdicts are cached per chunk: an unchanged re-read screens nothing, but an edit shifts every
+later chunk boundary, so the chunks from the edit onward re-screen. Its `[safety]` progress lines
+go to stderr.
+
 Found a security issue? Email `security@tarktoostus.ee` rather than opening a public issue.
 
 MIT licensed — see [LICENSE](LICENSE).

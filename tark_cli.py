@@ -101,6 +101,7 @@ Auth: TARK_PAT env var (legacy C2_PAT also works), or ~/.config/tark/config.json
 """
 
 import argparse
+import concurrent.futures
 import contextlib
 import getpass
 import json
@@ -109,6 +110,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -630,19 +632,28 @@ _SAFETY_PROMPT = (
     "out. Reply ONLY one line: 'SAFE' or 'UNSAFE: <one-line reason>'."
 )
 
-# Hard cap on the text handed to a provider. The gemini slot folds prompt+payload
-# into argv (`agy -p ...`), so an unbounded payload raised
+# Hard cap on the text handed to ONE provider call. The gemini slot folds
+# prompt+payload into argv (`agy -p ...`), so an unbounded payload raised
 # `OSError: [Errno 7] Argument list too long` and killed the whole chain before any
-# provider could answer -- a crash, not a verdict. Callers that hit this path exit
-# non-zero, and every gate that reads a failed fetch as "nothing to enforce" then
-# passed on nothing (a very large task wiki could clear a stage gate vacuously).
-# The cap matches the one `cmd_wiki` already applied to its non-string branch --
-# one convention, applied centrally so no caller can route around it.
-# Bound of what this trades away: only the FIRST 8000 chars are screened, so
-# injected text beyond that is unscreened. That is already true of every oversized
-# non-string payload, it fails loudly to stderr below, and it is strictly more
-# coverage than the crash it replaces (which screened nothing at all).
+# provider could answer -- a crash, not a verdict.
+# Full coverage, batched: a longer payload is split on line boundaries into
+# overlapping chunks that each fit this cap (_safety_chunks), EVERY chunk is
+# screened, and the text passes only when every chunk is judged SAFE (fail
+# closed). The old screen truncated to the first 8000 chars and left 93% of a
+# 107k-char card unscreened.
 _SAFETY_PAYLOAD_MAX = 8000
+# Chars each chunk repeats from the text just before it: an injection up to this
+# long that straddles a chunk boundary is read WHOLE in the later chunk. Longer
+# cross-chunk assembly is out of reach of a per-chunk judge (C2 #14877).
+_SAFETY_CHUNK_OVERLAP = 1000
+# Hard cap on a chunk's `<title> (part i/n)` label line, so label + blank line +
+# chunk never exceeds _SAFETY_PAYLOAD_MAX whatever the title length. A title
+# longer than _SAFETY_LABEL_TITLE_MAX is cut in the label and screened in full as
+# part of the chunked text instead.
+_SAFETY_LABEL_MAX = 200
+_SAFETY_LABEL_TITLE_MAX = 160
+# Chunks screened concurrently (each one runs its own provider chain).
+_SAFETY_PARALLEL = 4
 
 _SAFETY_FRAMING = {
     'wiki': 'Task wiki / PRD body',
@@ -865,6 +876,7 @@ def _run_safety_child(name: str, build_cmd: Callable[[str], list[str]], timeout:
 # Pinned models: an unpinned child picks whatever its config default is that day
 # (agy chose a spent model -> 429; codex defaults drift per account). Env overrides.
 _SAFETY_CODEX_MODEL = 'gpt-6-luna'
+_SAFETY_CLAUDE_EFFORT = 'medium'
 _SAFETY_AGY_MODEL = 'Gemini 3.8 Flash (High)'
 _SAFETY_CODEX_DISABLED = ('hooks', 'plugins', 'apps', 'shell_tool', 'browser_use',
                           'computer_use')
@@ -944,10 +956,19 @@ def _codex_auth_write_back(child_auth: Path, live_auth: Path) -> None:
         fresh = child_auth.read_bytes()
         if fresh == live_auth.read_bytes():
             return
-        tmp = live_auth.with_name(f'.{live_auth.name}.tark-safety-{os.getpid()}')
-        tmp.write_bytes(fresh)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, live_auth)
+        # Unique per call (mkstemp, 0600): no other writer -- thread or process --
+        # can share or truncate this temp before the atomic replace.
+        fd, tmp_name = tempfile.mkstemp(prefix=f'.{live_auth.name}.tark-safety-',
+                                        dir=live_auth.parent)
+        try:
+            with os.fdopen(fd, 'wb') as fh:
+                fh.write(fresh)
+            os.chmod(tmp_name, 0o600)
+            os.replace(tmp_name, live_auth)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_name)
+            raise
     except OSError as exc:
         print(f'[safety] warning: codex login refresh not written back '
               f'(oserror-{exc.errno})', file=sys.stderr)
@@ -982,6 +1003,14 @@ def _codex_auth_only_home():
             _codex_auth_write_back(child_auth, live_auth)
 
 
+# One codex child at a time per process. The chunked screen runs up to
+# _SAFETY_PARALLEL chains at once; parallel codex children would all spend the
+# SAME refresh token (a refresh rotates it server-side, so the losers hold a dead
+# token) and race the write-back into the live auth.json. Serialized, each child
+# starts from the login the previous one left behind.
+_SAFETY_CODEX_LOCK = threading.Lock()
+
+
 def _provider_codex(prompt: str, payload: str, timeout: int) -> tuple[str | None, str]:
     # Pinned model (SAFETY_CHECK_CODEX_MODEL overrides). Locked down: read-only
     # sandbox, no session file, no user config (drops config MCP / plugins / hooks),
@@ -999,7 +1028,7 @@ def _provider_codex(prompt: str, payload: str, timeout: int) -> tuple[str | None
             cmd += ['--disable', feature]
         return cmd + ['-c', 'mcp_servers={}', prompt]
 
-    with _codex_auth_only_home() as homes:
+    with _SAFETY_CODEX_LOCK, _codex_auth_only_home() as homes:
         proc, tag = _run_safety_child('codex', build, timeout, payload, homes)
     if proc is None:
         return None, tag
@@ -1014,7 +1043,9 @@ def _provider_claude(prompt: str, payload: str, timeout: int) -> tuple[str | Non
     # slash commands, no session file. `--tools ''` is followed by a BOOLEAN flag so
     # the prompt can never be read as a tool name. Payload on stdin.
     # Metered API opt-in: SAFETY_CHECK_USE_API_KEYS=1 with ANTHROPIC_API_KEY set.
-    cmd = ['claude', '--print', '--model', 'haiku', '--safe-mode', '--tools', '',
+    effort = os.environ.get('SAFETY_CHECK_CLAUDE_EFFORT') or _SAFETY_CLAUDE_EFFORT
+    cmd = ['claude', '--print', '--model', 'haiku', '--effort', effort,
+           '--safe-mode', '--tools', '',
            '--strict-mcp-config', '--setting-sources', '', '--disable-slash-commands',
            '--no-session-persistence', prompt]
     proc, tag = _run_safety_child('claude', lambda _cwd: cmd, timeout, payload)
@@ -1023,13 +1054,14 @@ def _provider_claude(prompt: str, payload: str, timeout: int) -> tuple[str | Non
     return _classify_failure('claude', proc)
 
 
-# Order: codex (bills ChatGPT) first, claude (bills the caller's Claude pool)
-# second, gemini/agy last and opt-in only (GEMINI_BIN). Override at runtime via
-# SAFETY_CHECK_SKIP="codex,claude" (comma-list).
+# Order: claude haiku first (cheap, fast, reads every chunk of a full card),
+# gemini/agy second but still opt-in only (GEMINI_BIN: agy persists every call as
+# a resumable conversation), codex last. Override at runtime via
+# SAFETY_CHECK_SKIP="claude,codex" (comma-list).
 _SAFETY_PROVIDERS: list[tuple[str, Callable[[str, str, int], tuple[str | None, str]]]] = [
-    ('codex', _provider_codex),
     ('claude', _provider_claude),
     ('gemini', _provider_gemini),
+    ('codex', _provider_codex),
 ]
 
 # sysexits: 1/2/3 are taken by ordinary CLI errors, so a screen outcome is
@@ -1056,12 +1088,88 @@ def _safety_off_tag(name: str) -> str | None:
     return None
 
 
+def _safety_chunks(text: str, limit: int, overlap: int = 0) -> list[str]:
+    """Split `text` into chunks of at most `limit` chars that overlap by `overlap`.
+
+    The text is first cut on line boundaries into spans of at most
+    `limit - overlap` chars (a longer line is hard-split), so ''.join(spans) ==
+    text. Chunk k is span k prefixed with the `overlap` chars just before it.
+    Every character is screened, and any substring of at most `overlap` chars
+    lies WHOLE inside the chunk holding its last character -- an injection cut by
+    a boundary is still read in one piece. `overlap` is clamped to limit // 2."""
+    limit = max(1, limit)
+    overlap = max(0, min(overlap, limit // 2))
+    step = max(1, limit - overlap)
+    spans: list[str] = []
+    cur: list[str] = []
+    size = 0
+    for line in text.splitlines(keepends=True):
+        while len(line) > step:
+            if cur:
+                spans.append(''.join(cur))
+                cur, size = [], 0
+            spans.append(line[:step])
+            line = line[step:]
+        if cur and size + len(line) > step:
+            spans.append(''.join(cur))
+            cur, size = [], 0
+        cur.append(line)
+        size += len(line)
+    if cur or not spans:
+        spans.append(''.join(cur))
+    chunks: list[str] = []
+    pos = 0
+    for span in spans:
+        chunks.append(text[max(0, pos - overlap):pos + len(span)])
+        pos += len(span)
+    return chunks
+
+
+def _safety_label(title: str, i: int, n: int) -> str:
+    """`<title> (part i/n)`, never longer than _SAFETY_LABEL_MAX (F13)."""
+    suffix = f' (part {i}/{n})'
+    head = title
+    if len(head) > _SAFETY_LABEL_TITLE_MAX:
+        head = head[:_SAFETY_LABEL_TITLE_MAX - 3] + '...'
+    return (head + suffix)[:_SAFETY_LABEL_MAX]
+
+
+def _safety_screen_one(mode: str, prompt: str, payload: str, skip: set[str],
+                       cache_hash: str, part: str) -> tuple[str | None, list[str]]:
+    """Run the provider chain on ONE payload; return (verdict or None, tried)."""
+    tried: list[str] = []
+    for name, fn in _SAFETY_PROVIDERS:
+        # Skip wins over off: an explicit skip is reported as such.
+        if name in skip:
+            tried.append(f'{name}-skip')
+            continue
+        off = _safety_off_tag(name)
+        if off:
+            tried.append(off)
+            continue
+        print(f'[safety] try provider={name} mode={mode} hash={cache_hash}{part}',
+              file=sys.stderr)
+        v, tag = fn(prompt, payload, 30)
+        line = (v or '').strip()
+        if line.upper() == 'SAFE' or line.upper().startswith('UNSAFE:'):
+            tried.append(tag)
+            return line, tried
+        tried.append(tag if not line else f'{name}-noverdict')
+    return None, tried
+
+
 def _safety_screen(mode: str, title: str, body: str) -> tuple[str | None, list[str]]:
-    """Run the cache + provider chain; return (verdict or None, tried tags).
+    """Run the cache + provider chain over the WHOLE text; return (verdict or None,
+    tried tags).
 
     A verdict is a normalized 'SAFE' / 'UNSAFE: ...' line; None = no provider
-    judged the content. Records a SAFE in the cache. Raises on any internal error
-    (the caller turns that into exit 70, never a pass)."""
+    judged some part of the content. A payload over _SAFETY_PAYLOAD_MAX is split
+    into overlapping line-boundary chunks (_safety_chunks); every chunk is
+    screened and cached on its own hash, and the text is SAFE only when every
+    chunk is. Any UNSAFE chunk wins over an unjudged one. Records SAFE in the
+    cache (per chunk and for the whole text). Raises on any internal error (the
+    caller turns that into exit 70, never a pass), including a payload that would
+    break the per-call cap."""
     if _sc is not None and _sc.lookup(mode, title, body):
         return 'SAFE', []
 
@@ -1075,41 +1183,78 @@ def _safety_screen(mode: str, title: str, body: str) -> tuple[str | None, list[s
 
     framing = _SAFETY_FRAMING.get(mode, 'Untrusted text')
     prompt = _SAFETY_PROMPT.format(framing=framing)
-    payload = f'{title or ""}\n\n{body or ""}'
-    if len(payload) > _SAFETY_PAYLOAD_MAX:
-        print(f'[safety] warning: payload {len(payload)} chars exceeds the '
-              f'{_SAFETY_PAYLOAD_MAX}-char provider cap - screening the first '
-              f'{_SAFETY_PAYLOAD_MAX} chars only; the remainder is UNSCREENED.',
-              file=sys.stderr)
-        payload = payload[:_SAFETY_PAYLOAD_MAX]
-    # Cache key stays keyed on the FULL body on purpose: a SAFE verdict recorded
-    # from a truncated screen must be invalidated by an edit anywhere in the body,
-    # including past the cap.
-    cache_hash = _sc._key(mode, title, body)[:8] if _sc is not None else 'no-cache'
+    title = title or ''
+    body = body or ''
+    payload = f'{title}\n\n{body}'
+    if len(payload) <= _SAFETY_PAYLOAD_MAX:
+        cache_hash = _sc._key(mode, title, body)[:8] if _sc is not None else 'no-cache'
+        verdict, tried = _safety_screen_one(mode, prompt, payload, skip, cache_hash, '')
+        if verdict is not None and verdict.upper() == 'SAFE' and _sc is not None:
+            _sc.record_safe(mode, title, body)
+        return verdict, tried
+
+    # A title too long for the label line is screened as text, not only labelled.
+    text = body if len(title) <= _SAFETY_LABEL_TITLE_MAX else payload
+    # Room for the label line (<= _SAFETY_LABEL_MAX) + blank line, never less.
+    chunks = _safety_chunks(text, _SAFETY_PAYLOAD_MAX - _SAFETY_LABEL_MAX - 2,
+                            _SAFETY_CHUNK_OVERLAP)
+    n = len(chunks)
+    print(f'[safety] full screen: {len(text)} chars in {n} chunks of <= '
+          f'{_SAFETY_PAYLOAD_MAX} chars ({_SAFETY_CHUNK_OVERLAP}-char overlap) '
+          f'mode={mode}', file=sys.stderr)
+
+    results: dict[int, tuple[str | None, list[str]]] = {}
+    pending: list[int] = []
+    for i, chunk in enumerate(chunks):
+        if _sc is not None and _sc.lookup(mode, title, chunk):
+            results[i] = ('SAFE', [])
+        else:
+            pending.append(i)
+    cached = n - len(pending)
+
+    def screen(i: int) -> tuple[str | None, list[str]]:
+        chunk = chunks[i]
+        cache_hash = _sc._key(mode, title, chunk)[:8] if _sc is not None else 'no-cache'
+        part_payload = f'{_safety_label(title, i + 1, n)}\n\n{chunk}'
+        if len(part_payload) > _SAFETY_PAYLOAD_MAX:  # never send past the cap
+            raise RuntimeError('safety chunk exceeds the provider cap')
+        verdict, tried = _safety_screen_one(mode, prompt, part_payload, skip,
+                                            cache_hash, f' part={i + 1}/{n}')
+        if verdict is not None and verdict.upper() == 'SAFE' and _sc is not None:
+            _sc.record_safe(mode, title, chunk)
+        return verdict, tried
+
+    if pending:
+        workers = max(1, min(_SAFETY_PARALLEL, len(pending)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(screen, i): i for i in pending}
+            for fut in concurrent.futures.as_completed(futures):
+                i = futures[fut]
+                results[i] = fut.result()  # re-raises a provider crash -> exit 70
+                v = results[i][0]
+                if v is not None and v.upper().startswith('UNSAFE:'):
+                    for other in futures:
+                        other.cancel()  # fail closed now; queued chunks are moot
+                    break
 
     tried: list[str] = []
-    verdict: str | None = None
-    for name, fn in _SAFETY_PROVIDERS:
-        # Skip wins over off: an explicit skip is reported as such.
-        if name in skip:
-            tried.append(f'{name}-skip')
-            continue
-        off = _safety_off_tag(name)
-        if off:
-            tried.append(off)
-            continue
-        print(f'[safety] try provider={name} mode={mode} hash={cache_hash}', file=sys.stderr)
-        v, tag = fn(prompt, payload, 30)
-        line = (v or '').strip()
-        if line.upper() == 'SAFE' or line.upper().startswith('UNSAFE:'):
-            tried.append(tag)
-            verdict = line
-            break
-        tried.append(tag if not line else f'{name}-noverdict')
-
-    if verdict is not None and verdict.upper() == 'SAFE' and _sc is not None:
+    for i in sorted(results):
+        tried += results[i][1]
+    for i in sorted(results):
+        v = results[i][0]
+        if v is not None and v.upper().startswith('UNSAFE:'):
+            reason = v.split(':', 1)[1].strip()
+            print(f'[safety] screened chunk {i + 1}/{n}: UNSAFE', file=sys.stderr)
+            return f'UNSAFE: part {i + 1}/{n}: {reason}', tried
+    judged = sum(1 for v, _ in results.values() if v is not None)
+    if judged < n:
+        print(f'[safety] screened {judged}/{n} chunks ({cached} cached): '
+              f'{n - judged} unjudged', file=sys.stderr)
+        return None, tried
+    print(f'[safety] screened {n}/{n} chunks ({cached} cached): SAFE', file=sys.stderr)
+    if _sc is not None:
         _sc.record_safe(mode, title, body)
-    return verdict, tried
+    return 'SAFE', tried
 
 
 def _safety_check_or_die(mode: str, title: str, body: str, force: bool,
@@ -1125,9 +1270,10 @@ def _safety_check_or_die(mode: str, title: str, body: str, force: bool,
     so (_AGENT_MARKERS). SAFETY_CHECK_FAIL_OPEN=1 (CI) lets the 75 case through,
     loudly on stderr and uncached; it never passes a 65 or a 70.
 
-    Chain + skip: see _SAFETY_PROVIDERS / SAFETY_CHECK_SKIP. SAFE verdicts cached
-    by SHA-256(model + mode + title + body) for 30 days (_safety_cache.py);
-    UNSAFE / no-verdict never cached.
+    Chain + skip: see _SAFETY_PROVIDERS / SAFETY_CHECK_SKIP. Whole text screened
+    in overlapping <= _SAFETY_PAYLOAD_MAX-char chunks (_safety_screen). SAFE
+    verdicts cached by SHA-256(policy + model + mode + title + body-or-chunk) for
+    30 days (_safety_cache.py); UNSAFE / no-verdict never cached.
     """
     if not _safety_enabled(force):
         return
@@ -2345,6 +2491,28 @@ def _wiki_prefix_titles(wiki_text: str, header: str) -> list[str]:
     return seen
 
 
+def _wiki_near_miss_hint(args, wiki_text: str, header: str) -> str:
+    """` Closest headers: A, B.` for a failed exact-match lookup, or ''.
+
+    The titles come from the wiki (another user's text), so they are sanitized for
+    the terminal AND safety-screened like any other wiki read before they print.
+    Not screened SAFE (UNSAFE, no verdict, crash) -> the titles are withheld and
+    only their count prints; the caller's not-found exit stays 1."""
+    near = [_sanitize_inline(t) for t in _wiki_prefix_titles(wiki_text, header)]
+    if not near:
+        return ''
+    if _safety_enabled(getattr(args, 'no_safety', False)):
+        try:
+            verdict, _tried = _safety_screen('wiki', f'task #{args.task_id} headings',
+                                             '\n'.join(near))
+        except Exception:  # noqa: BLE001 - a crashed screen is no verdict, never a pass
+            verdict = None
+        if verdict is None or verdict.upper() != 'SAFE':
+            return (f' {len(near)} near-miss header(s) withheld: the safety screen did '
+                    f'not judge them SAFE.')
+    return f' Closest headers: {", ".join(near)}.'
+
+
 def _wiki_section_body(wiki_text: str, span: tuple[int, int]) -> str:
     """Body text of a `## Header` block (everything after the header line)."""
     block = wiki_text[span[0]:span[1]]
@@ -2555,11 +2723,9 @@ def cmd_wiki_delete(args, path: str) -> None:
     spans = _wiki_exact_sections(wiki_text, header)
 
     if not spans:
-        # Titles come from the wiki, i.e. from another user -- sanitize before they
-        # reach a terminal. A title carrying an ESC byte would otherwise repaint the
-        # screen on a plain "header not found".
-        near = [_sanitize_inline(t) for t in _wiki_prefix_titles(wiki_text, header)]
-        hint = f' Closest headers: {", ".join(near)}.' if near else ''
+        # Titles come from the wiki, i.e. from another user -- sanitized and
+        # safety-screened before they reach the terminal (_wiki_near_miss_hint).
+        hint = _wiki_near_miss_hint(args, wiki_text, header)
         _err(f'No section titled exactly "## {header}" on task #{args.task_id}.{hint}')
         return
 
@@ -2590,11 +2756,85 @@ def cmd_wiki_delete(args, path: str) -> None:
     print(f'  wiki delete OK on task #{args.task_id} section "{header}"{tail}')
 
 
+def _wiki_headings(wiki_text: str) -> list[tuple[str, int]]:
+    """(title, body line count) per `## ` heading, in card order. Text above the
+    first heading is reported as `(preamble)` when it is non-blank."""
+    matches = list(_WIKI_HEADER_RE.finditer(wiki_text))
+    out: list[tuple[str, int]] = []
+    head = wiki_text[:matches[0].start()] if matches else wiki_text
+    if head.strip():
+        out.append(('(preamble)', len(head.strip('\n').splitlines())))
+    for i, m in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(wiki_text)
+        body = _wiki_section_body(wiki_text, (m.start(), end)).strip('\n')
+        out.append((m.group('title').strip(), len(body.splitlines()) if body else 0))
+    return out
+
+
+def cmd_wiki_get_part(args, wiki_body) -> None:
+    """`wiki <id> get --headings` / `get --section <H>`: print one slice of the card.
+
+    --headings: one line per `## ` heading with its body line count, plus a total
+    line -- the cheap map a reader takes before pulling one section.
+    --section H: the BODY of the first `## H` block (exact title match; a leading
+    `## ` in H is ignored), without its heading line -- ready for an edit and a
+    `set --section H --from-file` round-trip. A missing header exits 1 naming the
+    near-misses (screened; withheld unless SAFE): never a blank stdout that
+    reads as an empty section. Only the printed slice is safety-screened, in full."""
+    if not isinstance(wiki_body, str):
+        _err(f'task #{args.task_id} wiki is not markdown text; read it without '
+             f'--section/--headings')
+        return
+    if getattr(args, 'headings', False):
+        if args.section:
+            _err('use --headings or --section, not both')
+            return
+        rows = _wiki_headings(wiki_body)
+        _safety_check_or_die('wiki', f'task #{args.task_id} headings',
+                             '\n'.join(t for t, _ in rows),
+                             getattr(args, 'no_safety', False),
+                             where=f'wiki task #{args.task_id} headings')
+        if args.json:
+            _json_out({'task_id': args.task_id, 'chars': len(wiki_body),
+                       'lines': len(wiki_body.splitlines()),
+                       'headings': [{'title': t, 'lines': n} for t, n in rows]})
+            return
+        for title, n in rows:
+            label = title if title == '(preamble)' else f'## {title}'
+            print(f'{n:>5}  {_sanitize_inline(label)}')
+        print(f'total: {len(wiki_body.splitlines())} lines, {len(wiki_body)} chars, '
+              f'{sum(1 for t, _ in rows if t != "(preamble)")} sections')
+        return
+
+    header = args.section.strip().lstrip('#').strip()
+    if not header:
+        _err('get: --section must name a header, not just "#"')
+        return
+    spans = _wiki_exact_sections(wiki_body, header)
+    if not spans:
+        hint = _wiki_near_miss_hint(args, wiki_body, header)
+        _err(f'No section titled exactly "## {header}" on task #{args.task_id}.{hint}')
+        return
+    if len(spans) > 1:
+        _warn(f'"## {header}" appears {len(spans)}x on task #{args.task_id} -- printing '
+              f'the FIRST copy (the one set/replace/delete act on).')
+    body = _wiki_section_body(wiki_body, spans[0]).strip('\n')
+    _safety_check_or_die('wiki', f'task #{args.task_id}', body,
+                         getattr(args, 'no_safety', False),
+                         where=f'wiki task #{args.task_id} section "{header}"')
+    if args.json:
+        _json_out({'task_id': args.task_id, 'section': header, 'body': body,
+                   'copies': len(spans)})
+        return
+    print(body)
+
+
 def cmd_wiki(args):
     """Fetch / set / append / replace / delete / put task wiki.
 
     Actions:
-        get      - fetch the markdown body (default)
+        get      - fetch the markdown body (default); `--headings` prints only the
+                   heading map, `--section H` only that section's body
         set      - upsert: replace if section exists, else append (preferred for /brief)
         append   - add a new `## Section` block; if the header already exists,
                    MERGES onto the end of that section's OWN body (GET -> merge ->
@@ -2618,13 +2858,20 @@ def cmd_wiki(args):
     """
     path = f'/api/v1/pat/pm/tasks/{args.task_id}/wiki/'
 
+    if getattr(args, 'headings', False) and args.action not in (None, 'get'):
+        _err('--headings is a read flag: use it with `get` only')
+        return
+
     if args.action in (None, 'get'):
         data = _get(path)
         wiki_body = data.get('wiki', '') if isinstance(data, dict) else (data or '')
+        if getattr(args, 'headings', False) or getattr(args, 'section', None):
+            cmd_wiki_get_part(args, wiki_body)
+            return
         _safety_check_or_die(
             'wiki',
             f'task #{args.task_id}',
-            wiki_body if isinstance(wiki_body, str) else json.dumps(wiki_body)[:8000],
+            wiki_body if isinstance(wiki_body, str) else json.dumps(wiki_body),
             getattr(args, 'no_safety', False),
             where=f'wiki task #{args.task_id}',
         )
@@ -5125,11 +5372,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument('--tasks', help='Tasks as JSON array string')
     p.add_argument('--tasks-file', help='Path to JSON file containing the tasks array')
 
-    # wiki <task-id> [get|set|append|replace|delete|put] [--section H] [--body MD|--from-file P|--from-stdin] [--force] [--yes]
+    # wiki <task-id> [get|set|append|replace|delete|put] [--section H] [--headings] [--body MD|--from-file P|--from-stdin] [--force] [--yes]
     p = sub.add_parser('wiki', help='Task wiki get/set/append/replace/delete/put (sections via POST `body`; whole body via PUT `wiki`)')
     p.add_argument('task_id', type=int, help='Task ID')
     p.add_argument('action', nargs='?', choices=['get', 'set', 'append', 'replace', 'delete', 'put'], help='Default: get. `set` upserts a section; `delete` removes one; `put` replaces the whole wiki.')
-    p.add_argument('--section', help='Section header (without leading "## "). Required for set/append/replace/delete; ignored for put.')
+    p.add_argument('--section', help='Section header (a leading "## " is ignored). Required for set/append/replace/delete; '
+                                     'with get, prints only that section\'s body; ignored for put.')
+    p.add_argument('--headings', action='store_true',
+                   help='With get: print only the `## ` headings with their body line counts (read the map, then one --section).')
     p.add_argument('--body', help='Markdown body (literal). Use --from-file or --from-stdin for large content.')
     p.add_argument('--from-file', dest='from_file', help='Read body from a file path')
     p.add_argument('--from-stdin', dest='from_stdin', action='store_true', help='Read body from stdin (useful for piping)')
