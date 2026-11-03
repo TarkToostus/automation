@@ -4,10 +4,20 @@ Stores only SAFE verdicts — UNSAFE / unparseable / errors always re-screen.
 Bounded LRU + TTL. flock-guarded on POSIX, lock-free on Windows (acceptable:
 cache is single-user and races produce stale-but-not-corrupt JSON).
 
-Cache key = SHA-256(SAFETY_CHECK_MODEL + mode + title + body). SAFETY_CHECK_MODEL
+Cache key = SHA-256(SCREEN_POLICY + SAFETY_CHECK_MODEL + mode + title + body).
+SCREEN_POLICY names what a SAFE verdict covered; bump it whenever the screen's
+coverage changes, so verdicts recorded under a weaker screen (the first-8000-chars
+truncation before full chunked screening) miss instead of passing unread text.
+A text over the per-call cap is screened in overlapping line-boundary chunks;
+each chunk is cached under its own key (body = the chunk), and a fully SAFE text
+also under the whole-body key. A re-read of unchanged text therefore re-screens
+nothing. An edit is NOT confined to its own chunk: it shifts every later chunk
+boundary, so the edited chunk and usually every chunk after it re-screen; only
+the chunks before the edit stay cached. SAFETY_CHECK_MODEL
 selects a model only for the opt-in GEMINI_BIN=gemini enterprise CLI. The default
-chain ignores it: codex is pinned (SAFETY_CHECK_CODEX_MODEL), claude runs haiku,
-and agy is opt-in via GEMINI_BIN and pinned with --model (SAFETY_CHECK_AGY_MODEL).
+chain ignores it: claude runs haiku (first), agy is opt-in via GEMINI_BIN and
+pinned with --model (SAFETY_CHECK_AGY_MODEL), codex is pinned
+(SAFETY_CHECK_CODEX_MODEL).
 For them it is a manual cache-bust knob: bump it to invalidate every cached
 verdict. The key does not name the provider or its pinned model, so changing a
 pin does not invalidate cached SAFE verdicts by itself.
@@ -29,12 +39,16 @@ except ImportError:
     fcntl = None
     _HAS_FCNTL = False
 
-# Long TTL is safe: cache key is SHA-256(model + mode + title + body), so any
-# content edit changes the key and bumping SAFETY_CHECK_MODEL invalidates prior
-# verdicts on demand. 30 days; override via TARK_SAFETY_CACHE_TTL_SEC for
+# Long TTL is safe: cache key is SHA-256(policy + model + mode + title + body), so
+# any content edit changes the key, a SCREEN_POLICY bump invalidates verdicts from
+# a weaker screen, and bumping SAFETY_CHECK_MODEL invalidates prior verdicts on
+# demand. 30 days; override via TARK_SAFETY_CACHE_TTL_SEC for
 # stricter runs.
 _DEFAULT_TTL_SEC = 30 * 24 * 60 * 60  # 30 days (was 15 min)
 _DEFAULT_CAP = 10_000  # ~1.1 MB on disk at ~110 B/entry (was 1000)
+# v2: every chunk of the whole text screened, 1000-char overlap (C2 #14865).
+# Unversioned keys came from the first-8000-chars-only screen.
+SCREEN_POLICY = 'full-chunked-overlap-v2'
 
 
 def _cache_path() -> Path:
@@ -46,6 +60,8 @@ def _cache_path() -> Path:
 
 def _key(mode: str, title: str, body: str) -> str:
     h = hashlib.sha256()
+    h.update(SCREEN_POLICY.encode('utf-8'))
+    h.update(b'\n')
     h.update(os.environ.get('SAFETY_CHECK_MODEL', '').encode('utf-8'))
     h.update(b'\n')
     h.update((mode or '').encode('utf-8'))
